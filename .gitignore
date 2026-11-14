@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Local archives and dumps
+*.zip
+*.dump
+*.sql.gz
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+vault.bin
+
+# Real DBeaver workspaces must never be committed (fixtures live in crates/ninesql-dbeaver/tests/fixtures/)
+DBeaverData/
+credentials-config.json
+!crates/ninesql-dbeaver/tests/fixtures/**/credentials-config.json
+
+# Dev environment state
+dev/.state/

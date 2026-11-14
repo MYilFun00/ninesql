@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Driver crates are added under crates/drivers/ from P1-B (ADR-0003) and listed here.
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Yil00/ninesql"
+authors = ["NineSQL contributors"]
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[workspace.dependencies]
+# Internal crates
+ninesql-core = { path = "crates/ninesql-core" }
+ninesql-driver-api = { path = "crates/ninesql-driver-api" }
+ninesql-storage = { path = "crates/ninesql-storage" }
+ninesql-secrets = { path = "crates/ninesql-secrets" }
+ninesql-ssh = { path = "crates/ninesql-ssh" }
+ninesql-transfer = { path = "crates/ninesql-transfer" }
+ninesql-dbeaver = { path = "crates/ninesql-dbeaver" }
+ninesql-grid = { path = "crates/ninesql-grid" }
+ninesql-editor = { path = "crates/ninesql-editor" }
+
+# GPUI and gpui-component are pinned to one git revision pair in P0-A (ADR-0001), e.g.:
+# gpui = { git = "https://github.com/zed-industries/zed", rev = "<sha>" }
+# gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "<sha>" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

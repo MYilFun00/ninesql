@@ -1,0 +1,21 @@
+[package]
+name = "ninesql-core"
+description = "Application state, connection model and services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ninesql-driver-api.workspace = true
+ninesql-storage.workspace = true
+ninesql-secrets.workspace = true
+ninesql-ssh.workspace = true
+ninesql-transfer.workspace = true
+ninesql-dbeaver.workspace = true

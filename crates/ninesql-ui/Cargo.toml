@@ -1,0 +1,22 @@
+[package]
+name = "ninesql-ui"
+description = "NineSQL desktop application (GPUI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ninesql-core.workspace = true
+ninesql-grid.workspace = true
+ninesql-editor.workspace = true
+
+[[bin]]
+name = "ninesql"
+path = "src/main.rs"

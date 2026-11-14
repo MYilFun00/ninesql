@@ -1,0 +1,9 @@
+# The last matching pattern wins. Security-sensitive areas need the maintainer's review, which records
+# the security-reviewer subagent's report (AGENTS.md). Enforced when branch protection requires code owners.
+* @Yil00
+/crates/ninesql-secrets/ @Yil00
+/crates/ninesql-ssh/ @Yil00
+/crates/ninesql-driver-api/ @Yil00
+/crates/ninesql-dbeaver/ @Yil00
+/deny.toml @Yil00
+/.github/ @Yil00
