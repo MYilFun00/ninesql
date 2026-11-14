@@ -1,7 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
-# Driver crates are added under crates/drivers/ from P1-B (ADR-0003) and listed here.
+members = ["crates/ninesql-*", "crates/drivers/*"]
+# Driver crates live under crates/drivers/, one per protocol family (ADR-0003).
+# Patched copies of third-party crates (docs/audits/gpui-snapshot.md): reached only through
+# [patch.crates-io] below, never workspace members.
+exclude = ["crates/patches"]
 
 [workspace.package]
 version = "0.0.0"
@@ -43,9 +46,21 @@ proptest = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Comment-preserving edits of settings.toml (P1-A); the version toml 0.8 already uses.
+toml_edit = { version = "0.22", default-features = false, features = ["parse", "display"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 secrecy = "0.10"
 secret-service = { version = "=6.0.0-rc.1", default-features = false, features = ["rt-default", "crypto-rust"] }
+# Same zbus 6 as secret-service pulls in: only to build its session connection with a method
+# timeout (zbus 6 has none by default).
+zbus = { version = "6", default-features = false, features = ["default-rt", "proxy"] }
+# Encrypted vault (P1-D, ADR-0005 §2): RustCrypto crates only, versions aligned with the ones
+# russh already pulls in (argon2 0.6, chacha20 0.10, aead 0.6, getrandom 0.4).
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+getrandom = { version = "0.4", default-features = false }
+# Not used directly: enables `zeroize` on the aes 0.9 that secret-service already pulls in.
+aes = { version = "0.9", default-features = false, features = ["zeroize"] }
 tempfile = "3"
 libc = "0.2"
 # Safe `geteuid` for the workspace ownership check (already in the graph through tempfile).
@@ -73,6 +88,20 @@ futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false }
 
+# pgwire driver (P1-B, ADR-0003): the PostgreSQL message codec of rust-postgres (no client, no
+# OpenSSL), rustls with the `ring` provider only (ADR-0011, ADR-0016 §3), the platform trust store.
+postgres-protocol = "0.6.12"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8.5"
+rustls-pki-types = { version = "1.16", features = ["std"] }
+ring = "0.17.14"
+md-5 = "0.11"
+base64 = "0.22"
+stringprep = "0.1"
+fallible-iterator = "0.2"
+bytes = "1.11"
+
 # GPUI and gpui-component, pinned as one set from crates.io (ADR-0013, P0-A, docs/spikes/p0-a-gpui.md).
 # gpui-kit 0.9.1 = longbridge/gpui-component tag v0.9.1 (39ab849a93b5f15507b969164d49891db8d5b470);
 # it pins GPUI exactly to gpui-pre =0.3.12, a snapshot of zed-industries/zed@d2a4fb6.
@@ -89,6 +118,22 @@ gpui-kit-assets = { version = "=0.9.1", default-features = false }
 # `test-support` feature (TestAppContext) without gpui-kit's `test-support`, which would drag the
 # optional `gpui-fast` family into Cargo.lock through weak features.
 gpui-pre = { version = "=0.3.12", default-features = false }
+
+# Argon2 is very slow unoptimized; the vault derives its key with the real parameters (64 MiB)
+# in debug builds and tests too.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+# X11 IME crash fix (P1-A follow-up, docs/spikes/p0-a-gpui.md): exact copies of the crates.io
+# releases locked in Cargo.lock, changed only where a file says "Modified for NineSQL". Each patch
+# keeps the upstream version number, so `cargo update` cannot move it; drop it once upstream
+# ships the fix. The diff summary is in docs/audits/gpui-snapshot.md.
+[patch.crates-io]
+xim-ctext = { path = "crates/patches/xim-ctext" }
+zed-xim = { path = "crates/patches/zed-xim" }
 
 [profile.release]
 lto = "thin"
