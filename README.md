@@ -1,6 +1,6 @@
 <br />
 <div align="center">
-  <img src="docs/assets/logo.svg" alt="NineSQL" width="96" height="96">
+  <img src="docs/assets/logo.svg" alt="NineSQL" width="120" height="120">
 
 <h3 align="center">NineSQL</h3>
 
