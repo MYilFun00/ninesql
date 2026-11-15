@@ -62,7 +62,8 @@ pub struct MySession {
     pub(crate) dialect: Arc<MyDialect>,
     pub(crate) control: Arc<Control>,
     /// Statement text may be logged at `trace` level (`ConnectParams::may_log_statements`:
-    /// the connection type allows it and the connection is not production, ADR-0007 §6).
+    /// the connection type allows it and the connection is not production, ADR-0007 §6), and
+    /// only a text that holds no credential (`may_log_statement_text`, I1).
     pub(crate) log_statements: bool,
     /// Cancel flag of the current execution, shared with `Session::cancel_handle`.
     pub(crate) current_exec: std::sync::Mutex<Arc<ExecCancel>>,
@@ -89,7 +90,8 @@ impl MySession {
     ) -> DriverResult<ResultStream> {
         let shared = &self.link.shared;
         let text = self.dialect.bind(&statement.text, &statement.params)?;
-        if self.log_statements {
+        // Never a text that may hold a credential, init SQL included (I1).
+        if ninesql_driver_api::may_log_statement_text(self.log_statements, &statement.text) {
             tracing::trace!(statement = %statement.text, "mysqlwire execute");
         }
         let guard = self.link.tracker.begin()?;
@@ -266,6 +268,13 @@ impl Session for MySession {
         }
         if self.link.tracker.is_busy() {
             return Err(DriverError::Busy);
+        }
+        // A NUL byte ends the text for some lexers and not for others: refused, as in sqlite
+        // (security review L5).
+        if statement.text.contains('\0') {
+            return Err(DriverError::InvalidParams(
+                "the statement holds a NUL character".into(),
+            ));
         }
         // One statement per protocol call, with the session's current lexical rules.
         ensure_single_statement(self.dialect.as_ref(), &statement.text)?;

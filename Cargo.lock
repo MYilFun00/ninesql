@@ -4561,6 +4561,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
  "tracing",
  "uuid",
  "zeroize",
@@ -4676,14 +4678,27 @@ dependencies = [
 name = "ninesql-editor"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "gpui-pre",
+ "lsp-types",
  "ninesql-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
 name = "ninesql-grid"
 version = "0.0.0"
 dependencies = [
+ "gpui-kit",
+ "gpui-pre",
  "ninesql-core",
+ "tracing",
 ]
 
 [[package]]
@@ -4736,6 +4751,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "proptest",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",
