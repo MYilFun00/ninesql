@@ -106,14 +106,25 @@ pub fn open_window(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)>
     }
 }
 
-/// Entry point of the `ninesql` binary.
-pub fn run() {
-    // A small local file read before the event loop starts; no I/O happens on the foreground
-    // thread once windows are open (I6).
+/// Entry point of the `ninesql` binary, with the drivers it ships registered in `registry`
+/// (L5; src/main.rs).
+pub fn run(registry: ninesql_core::DriverRegistry) {
+    // A small local file read before the event loop starts (settings.toml); no I/O happens on
+    // the foreground thread once windows are open (I6).
     let settings = crate::settings::load_from_env();
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         init(settings, cx);
+        // The core (workspace, secret stores, vault, lock watcher, driver runtime) starts off
+        // the UI thread; windows open at once and the hub fills in when it is ready.
+        crate::connections::hub::start(registry, cx);
+        cx.on_app_quit(|cx| {
+            if let Some(hub) = crate::connections::hub::Hub::get(cx) {
+                hub.update(cx, |hub, _| hub.shutdown(std::time::Duration::from_secs(2)));
+            }
+            async {}
+        })
+        .detach();
         // Quit with the last window, as Linux desktop applications do.
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
