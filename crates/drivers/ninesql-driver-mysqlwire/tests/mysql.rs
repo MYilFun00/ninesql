@@ -415,10 +415,11 @@ async fn read_only_refuses_writes_engine_side() {
 }
 
 /// Security review H1: `SET TRANSACTION … READ WRITE` (no SESSION) only changes the next
-/// transaction and leaves `transaction_read_only` at 1, so the read-back cannot see it; the
-/// comma form is classified `Session` by the shared classifier. The driver re-asserts the
-/// session's read-only characteristic after every statement, so the next write still fails
-/// engine-side.
+/// transaction and leaves `transaction_read_only` at 1, so the read-back cannot see it. The
+/// shared classifier refuses the comma form client-side; the driver still re-asserts the
+/// session's read-only characteristic after every statement, as defence in depth against
+/// classifier gaps (a MariaDB stored function here, and the comma form sent past the
+/// classifier in `src/session.rs`), so the next write still fails engine-side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_read_write_transaction_is_reset() {
     const ONE_SHOT: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
@@ -440,9 +441,19 @@ async fn one_shot_read_write_transaction_is_reset() {
         for manual in [false, true] {
             s.set_auto_commit(!manual).await.unwrap();
             for lift in &lifts {
-                // Accepted (not classified as a lift), but it must not open a writable
-                // transaction.
-                run(s.as_mut(), lift).await.unwrap();
+                if *lift == ONE_SHOT {
+                    // The comma form is classified `ChangesAccessMode` since the reviewed
+                    // driver-API PR: refused client-side, it never reaches the server.
+                    assert!(
+                        matches!(run(s.as_mut(), lift).await, Err(DriverError::ReadOnly(_))),
+                        "{} manual={manual}: the comma form was not refused",
+                        dev.engine
+                    );
+                } else {
+                    // Not classified as a lift (a stored function), but it must not open a
+                    // writable transaction.
+                    run(s.as_mut(), lift).await.unwrap();
+                }
                 match run(s.as_mut(), "SELECT ninesql_write_one()").await {
                     Err(DriverError::ReadOnly(_)) => {}
                     other => panic!(

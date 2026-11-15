@@ -390,9 +390,11 @@ async fn read_only_refuses_writes_engine_side() {
 }
 
 /// Security review of mysqlwire (H1), checked on pgwire too: `SET TRANSACTION … READ WRITE`
-/// changes only the current transaction and leaves `default_transaction_read_only` on; its
-/// comma form is classified `Session` by the shared classifier. A write after it must still
-/// fail engine-side, in autocommit, in manual-commit mode and in an explicit transaction.
+/// changes only the current transaction and leaves `default_transaction_read_only` on. The
+/// shared classifier refuses its comma form client-side; the driver's re-assert remains as
+/// defence in depth against classifier gaps (tested past the classifier in `src/session.rs`).
+/// A write after it must fail, in autocommit, in manual-commit mode and in an explicit
+/// transaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_read_write_transaction_cannot_write() {
     const ONE_SHOT: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
@@ -416,8 +418,16 @@ async fn one_shot_read_write_transaction_cannot_write() {
             }
             _ => {}
         }
-        // Outside a transaction block PostgreSQL only warns; inside one it is accepted.
-        let _ = run(s.as_mut(), ONE_SHOT).await;
+        // The comma form is classified `ChangesAccessMode` since the reviewed driver-API PR:
+        // refused client-side. The driver's `SET TRANSACTION READ ONLY` re-assert stays as
+        // defence in depth.
+        assert!(
+            matches!(
+                run(s.as_mut(), ONE_SHOT).await,
+                Err(DriverError::ReadOnly(_))
+            ),
+            "{mode}: the comma form was not refused"
+        );
         match run(s.as_mut(), "SELECT ninesql_test.write_one()").await {
             Err(DriverError::ReadOnly(_)) => {}
             other => panic!(
@@ -437,7 +447,7 @@ async fn one_shot_read_write_transaction_cannot_write() {
     };
     // Savepoints: the one-shot READ WRITE, then SAVEPOINT, a write, ROLLBACK TO, a write.
     s.begin().await.unwrap();
-    let _ = run(s.as_mut(), ONE_SHOT).await;
+    assert!(run(s.as_mut(), ONE_SHOT).await.is_err());
     s.savepoint("sp").await.unwrap();
     write_refused(
         run(s.as_mut(), "SELECT ninesql_test.write_one()").await,
@@ -451,7 +461,7 @@ async fn one_shot_read_write_transaction_cannot_write() {
     s.rollback().await.unwrap();
     // An aborted transaction, then ROLLBACK TO, then a write.
     s.begin().await.unwrap();
-    let _ = run(s.as_mut(), ONE_SHOT).await;
+    assert!(run(s.as_mut(), ONE_SHOT).await.is_err());
     s.savepoint("sp").await.unwrap();
     assert!(run(s.as_mut(), "SELECT 1 / 0").await.is_err());
     s.rollback_to_savepoint("sp").await.unwrap();
