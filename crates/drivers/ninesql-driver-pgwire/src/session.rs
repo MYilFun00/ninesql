@@ -1,4 +1,4 @@
-//! [`Session`] and [`Metadata`] of the pgwire driver: thin fronts that check the contract
+//! [`Session`] of the pgwire driver: thin fronts that check the contract
 //! (one statement, classification, read-only refusal, busy state) and send commands to the
 //! connection task.
 
@@ -7,16 +7,17 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ninesql_driver_api::{
-    CancelHandle, Capabilities, ColumnInfo, Dialect, DriverError, DriverResult, ExecOptions,
-    ExecutionTracker, Feature, IsolationLevel, Metadata, ObjectDetails, ObjectInfo, ObjectKind,
-    ObjectPath, Page, PageRequest, QueryLanguage, ResultItem, ResultStream, Session, Statement,
-    StatementClass, TableInfo, ensure_single_statement, escape_like,
+    CancelHandle, Capabilities, Dialect, DriverError, DriverResult, ExecOptions, ExecutionTracker,
+    Feature, IsolationLevel, Metadata, QueryLanguage, ResultItem, ResultStream, Session, Statement,
+    StatementClass, ensure_single_statement,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::{Chunk, Command, Demand, ExecRequest, Rows, Shared, params_supported};
-use crate::cancel::{CancelTarget, ExecCancel, PgCancel};
+use crate::cancel::{CancelTarget, ExecCancel, MetaGate, PgCancel};
 use crate::dialect::PgDialect;
+use crate::engine::{self, Flavor, ServerInfo};
+use crate::metadata::PgMetadata;
 
 /// Handles shared by the session and its metadata.
 #[derive(Clone)]
@@ -34,23 +35,87 @@ impl Link {
         params: Vec<Option<String>>,
         max_rows: i32,
     ) -> DriverResult<Rows> {
+        self.internal_limited(sql, params, max_rows, None, None)
+            .await
+    }
+
+    /// [`internal`](Self::internal) with a value limit (`Command::Internal::value_limit`) and,
+    /// for navigator calls, the cancel target: if the caller drops the future before the
+    /// answer, the statement is cancelled server-side (scoped to this execution).
+    pub(crate) async fn internal_limited(
+        &self,
+        sql: &str,
+        params: Vec<Option<String>>,
+        max_rows: i32,
+        value_limit: Option<usize>,
+        cancel_on_drop: Option<&Arc<CancelTarget>>,
+    ) -> DriverResult<Rows> {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(self.shared.closed_error());
         }
         let guard = self.tracker.begin()?;
+        let gate = cancel_on_drop.map(|_| Arc::new(MetaGate::default()));
+        let mut on_drop = cancel_on_drop
+            .zip(gate.as_ref())
+            .map(|(target, gate)| CancelOnDrop {
+                tracker: self.tracker.clone(),
+                id: guard.id(),
+                target: Arc::clone(target),
+                gate: Arc::clone(gate),
+                armed: true,
+            });
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Internal {
                 sql: sql.to_owned(),
                 params,
                 max_rows,
+                value_limit,
+                gate,
                 verify: true,
                 guard,
                 reply,
             })
             .await
             .map_err(|_| self.shared.closed_error())?;
-        rx.await.map_err(|_| self.shared.closed_error())?
+        let result = rx.await.map_err(|_| self.shared.closed_error());
+        // Answered: nothing left to cancel.
+        if let Some(d) = on_drop.as_mut() {
+            d.armed = false;
+        }
+        result?
+    }
+}
+
+/// Cancels execution `id` server-side when dropped (a navigator call abandoned by its caller,
+/// for example by the core's timeout). Scoped by the tracker: a no-op once `id` has ended.
+struct CancelOnDrop {
+    tracker: ExecutionTracker,
+    id: ninesql_driver_api::ExecutionId,
+    target: Arc<CancelTarget>,
+    gate: Arc<MetaGate>,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        // Only while the navigator statement itself runs (never its savepoint handling).
+        if !self.armed || !self.gate.abandon() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let handle = self.tracker.cancel_handle(
+            self.id,
+            Arc::new(PgCancel {
+                target: Arc::clone(&self.target),
+                exec: Arc::new(ExecCancel::default()),
+            }),
+        );
+        rt.spawn(async move {
+            let _ = handle.cancel().await;
+        });
     }
 }
 
@@ -144,8 +209,138 @@ impl PgSession {
         self.link.internal(sql, Vec::new(), 0).await
     }
 
+    fn flavor(&self) -> Flavor {
+        self.link.shared.flavor
+    }
+
+    /// QuestDB has no transactions in the PostgreSQL sense (I8).
+    fn refuse_on_questdb(&self) -> DriverResult<()> {
+        if self.flavor() == Flavor::QuestDb {
+            Err(DriverError::Unsupported(Feature::Transactions))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Checks the server against the declared engine from inside the session (`version()`,
+    /// the `timescaledb` extension) and reads what the exact capabilities depend on. A mismatch
+    /// fails the connect (docs/08, P4-C).
+    pub(crate) async fn check_server(&mut self, info: &mut ServerInfo) -> DriverResult<()> {
+        let flavor = self.flavor();
+        let first = |rows: Rows| {
+            rows.into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next())
+                .flatten()
+        };
+        let version_fn = first(self.run("SELECT pg_catalog.version()").await?).unwrap_or_default();
+        let param = self.capabilities.server_version.clone().unwrap_or_default();
+        engine::check_family(
+            flavor,
+            engine::server_family(&param, Some(&version_fn)),
+            &version_fn,
+        )?;
+        match flavor {
+            Flavor::Postgres | Flavor::Timescale => {
+                let ts = first(
+                    self.run(
+                        "SELECT e.extversion::pg_catalog.text FROM pg_catalog.pg_extension e \
+                         WHERE e.extname OPERATOR(pg_catalog.=) 'timescaledb'::pg_catalog.name",
+                    )
+                    .await?,
+                );
+                if flavor == Flavor::Timescale {
+                    if ts.is_none() {
+                        return Err(DriverError::Connect(
+                            "this database has no timescaledb extension, so it is not \
+                             TimescaleDB; choose PostgreSQL, or create the extension first"
+                                .into(),
+                        ));
+                    }
+                    info.timescale_version = ts;
+                }
+            }
+            Flavor::Yugabyte => {
+                // Without its read-committed mode YugabyteDB runs READ COMMITTED as snapshot
+                // isolation: ask the server what a READ COMMITTED transaction really runs.
+                self.run("BEGIN ISOLATION LEVEL READ COMMITTED").await?;
+                let effective = self
+                    .run(
+                        "SELECT pg_catalog.current_setting(\
+                         'yb_effective_transaction_isolation_level'::pg_catalog.text, true)",
+                    )
+                    .await;
+                self.run("ROLLBACK").await?;
+                info.yb_read_committed =
+                    first(effective?).is_some_and(|v| v.eq_ignore_ascii_case("read committed"));
+            }
+            Flavor::QuestDb => {}
+        }
+        Ok(())
+    }
+
+    /// QuestDB: no session read-only mode. A session is read-only only when the server makes it
+    /// so (its read-only user, or a read-only server), which is checked twice: in the server's
+    /// settings, and with a write that changes nothing whatever the account and must fail with
+    /// a permission error. Anything else is refused, never faked (I3, I8).
+    async fn apply_questdb_read_only(&mut self, read_only: bool) -> DriverResult<()> {
+        if !read_only {
+            return Err(DriverError::ReadOnly(
+                "QuestDB's read-only mode belongs to the account or the server; connect as a \
+                 user that may write instead"
+                    .into(),
+            ));
+        }
+        let refused = || {
+            DriverError::ReadOnly(
+                "QuestDB has no session read-only mode and this account can write, so the \
+                 read-only session was refused; connect as QuestDB's read-only user \
+                 (pg.readonly.user) or to a read-only server (pg.security.readonly)"
+                    .into(),
+            )
+        };
+        let settings: Vec<(String, String)> = self
+            .run(engine::QUESTDB_READ_ONLY_SETTINGS_SQL)
+            .await
+            .map_err(|_| refused())?
+            .into_iter()
+            .filter_map(|r| {
+                let mut it = r.into_iter();
+                Some((it.next().flatten()?, it.next().flatten()?))
+            })
+            .collect();
+        let user = self
+            .run("SELECT current_user()")
+            .await
+            .map_err(|_| refused())?
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .flatten()
+            .unwrap_or_default();
+        let denied = match self.run(engine::QUESTDB_WRITE_PROBE_SQL).await {
+            Err(DriverError::Query { message, .. }) => engine::questdb_probe_denied(&message),
+            Err(DriverError::ReadOnly(_)) => true,
+            _ => false,
+        };
+        // Both checks, ANDed on purpose (security review L3): neither alone is trusted. The
+        // settings can claim a read-only user that may write (QuestDB 10.2: a read-only user
+        // enabled by `reload_config()` rather than at startup logs in with write access), and
+        // a permission error alone does not say the whole session is read-only. Tested on
+        // open-source QuestDB only (QuestDB Enterprise has its own access control).
+        if engine::questdb_settings_read_only(&settings, &user) && denied {
+            self.link.shared.read_only.store(true, Ordering::SeqCst);
+            Ok(())
+        } else {
+            Err(refused())
+        }
+    }
+
     /// Applies (or lifts) the engine-side read-only mode and verifies it by reading it back.
     pub(crate) async fn apply_read_only(&mut self, read_only: bool) -> DriverResult<()> {
+        if self.flavor() == Flavor::QuestDb {
+            return self.apply_questdb_read_only(read_only).await;
+        }
         let sql = if read_only {
             "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
         } else {
@@ -240,6 +435,7 @@ impl Session for PgSession {
     fn metadata(&self) -> Arc<dyn Metadata> {
         Arc::new(PgMetadata {
             link: self.link.clone(),
+            cancel_target: Arc::clone(&self.cancel_target),
         })
     }
 
@@ -266,6 +462,9 @@ impl Session for PgSession {
         // One statement per protocol call, with the session's current lexical rules.
         ensure_single_statement(self.dialect.as_ref(), &statement.text)?;
         let class = self.dialect.classify(&statement.text);
+        if class == StatementClass::Transaction && self.flavor() == Flavor::QuestDb {
+            return Err(DriverError::Unsupported(Feature::Transactions));
+        }
         if self.is_read_only() && class.is_write() {
             return Err(DriverError::ReadOnly(
                 "statement refused: the session is read-only".into(),
@@ -296,6 +495,9 @@ impl Session for PgSession {
     }
 
     async fn set_auto_commit(&mut self, auto_commit: bool) -> DriverResult<()> {
+        if !auto_commit {
+            self.refuse_on_questdb()?;
+        }
         if auto_commit && !self.auto_commit && self.in_transaction() {
             // JDBC semantics: switching to auto-commit commits the open transaction.
             self.commit().await?;
@@ -305,10 +507,14 @@ impl Session for PgSession {
     }
 
     async fn begin(&mut self) -> DriverResult<()> {
+        self.refuse_on_questdb()?;
         self.run("BEGIN").await.map(drop)
     }
 
     async fn commit(&mut self) -> DriverResult<()> {
+        if self.flavor() == Flavor::QuestDb && !self.in_transaction() {
+            return Ok(());
+        }
         let failed = self.link.shared.txn_status.load(Ordering::SeqCst) == b'E';
         self.run("COMMIT").await?;
         if failed {
@@ -322,15 +528,20 @@ impl Session for PgSession {
     }
 
     async fn rollback(&mut self) -> DriverResult<()> {
+        if self.flavor() == Flavor::QuestDb && !self.in_transaction() {
+            return Ok(());
+        }
         self.run("ROLLBACK").await.map(drop)
     }
 
     async fn savepoint(&mut self, name: &str) -> DriverResult<()> {
+        self.refuse_on_questdb()?;
         let sql = format!("SAVEPOINT {}", self.dialect.quote_identifier(name));
         self.run(&sql).await.map(drop)
     }
 
     async fn rollback_to_savepoint(&mut self, name: &str) -> DriverResult<()> {
+        self.refuse_on_questdb()?;
         let sql = format!(
             "ROLLBACK TO SAVEPOINT {}",
             self.dialect.quote_identifier(name)
@@ -339,6 +550,15 @@ impl Session for PgSession {
     }
 
     async fn set_isolation_level(&mut self, level: IsolationLevel) -> DriverResult<()> {
+        self.refuse_on_questdb()?;
+        if !self
+            .capabilities
+            .transactions
+            .isolation_levels
+            .contains(&level)
+        {
+            return Err(DriverError::Unsupported(Feature::Transactions));
+        }
         let level = match level {
             IsolationLevel::ReadCommitted => "READ COMMITTED",
             IsolationLevel::RepeatableRead => "REPEATABLE READ",
@@ -390,236 +610,6 @@ impl Session for PgSession {
         }
         self.link.shared.mark_closed("session closed");
         Ok(())
-    }
-}
-
-/// Navigator metadata, served on the session's connection: a call made while a result streams
-/// fails with [`DriverError::Busy`]. User input (filter, names, cursor) is always bound.
-pub struct PgMetadata {
-    link: Link,
-}
-
-impl std::fmt::Debug for PgMetadata {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PgMetadata").finish_non_exhaustive()
-    }
-}
-
-// Internal SQL never depends on the session's `search_path` (CVE-2018-1058 class: a user
-// object such as `public.||(name, text)` is a better match than the built-in and would run with
-// the browsing user's privileges). Every operator is `OPERATOR(pg_catalog.…)`, every function,
-// type, relation and collation is schema-qualified, and `LIKE … ESCAPE` is written as
-// `OPERATOR(pg_catalog.~~)` with `pg_catalog.like_escape`. `pg_temp` is never searched for
-// functions or operators, and qualified relations bypass it.
-
-const SCHEMAS_SQL: &str = "\
-SELECT n.nspname::pg_catalog.text, \
-       pg_catalog.obj_description(n.oid, 'pg_namespace'::pg_catalog.name) \
-FROM pg_catalog.pg_namespace n \
-WHERE NOT (n.nspname::pg_catalog.text OPERATOR(pg_catalog.~) '^pg_toast'::pg_catalog.text) \
-  AND NOT (n.nspname::pg_catalog.text OPERATOR(pg_catalog.~) '^pg_temp_'::pg_catalog.text) \
-  AND ($1::pg_catalog.text IS NULL OR n.nspname::pg_catalog.text OPERATOR(pg_catalog.~~) \
-       pg_catalog.like_escape($1::pg_catalog.text, '!'::pg_catalog.text)) \
-  AND ($2::pg_catalog.text IS NULL OR n.nspname::pg_catalog.text COLLATE pg_catalog.\"C\" \
-       OPERATOR(pg_catalog.>) $2::pg_catalog.text COLLATE pg_catalog.\"C\") \
-ORDER BY n.nspname::pg_catalog.text COLLATE pg_catalog.\"C\" LIMIT $3::pg_catalog.int8";
-
-const RELATIONS_SQL: &str = "\
-SELECT c.relname::pg_catalog.text, \
-       pg_catalog.obj_description(c.oid, 'pg_class'::pg_catalog.name), \
-       c.reltuples::pg_catalog.int8::pg_catalog.text, c.relkind::pg_catalog.text \
-FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n \
-  ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
-WHERE n.nspname::pg_catalog.text OPERATOR(pg_catalog.=) $4::pg_catalog.text \
-  AND c.relkind::pg_catalog.text OPERATOR(pg_catalog.=) ANY($5::pg_catalog.text[]) \
-  AND ($1::pg_catalog.text IS NULL OR c.relname::pg_catalog.text OPERATOR(pg_catalog.~~) \
-       pg_catalog.like_escape($1::pg_catalog.text, '!'::pg_catalog.text)) \
-  AND ($2::pg_catalog.text IS NULL OR c.relname::pg_catalog.text COLLATE pg_catalog.\"C\" \
-       OPERATOR(pg_catalog.>) $2::pg_catalog.text COLLATE pg_catalog.\"C\") \
-ORDER BY c.relname::pg_catalog.text COLLATE pg_catalog.\"C\" LIMIT $3::pg_catalog.int8";
-
-const COLUMNS_SQL: &str = "\
-SELECT a.attname::pg_catalog.text, pg_catalog.col_description(a.attrelid, a.attnum::pg_catalog.int4), \
-       a.attnum::pg_catalog.text, pg_catalog.format_type(a.atttypid, a.atttypmod), \
-       (NOT a.attnotnull)::pg_catalog.text, pg_catalog.pg_get_expr(d.adbin, d.adrelid), \
-       (EXISTS (SELECT 1 FROM pg_catalog.pg_index i \
-                WHERE i.indrelid OPERATOR(pg_catalog.=) a.attrelid AND i.indisprimary \
-                  AND a.attnum OPERATOR(pg_catalog.=) ANY(i.indkey::pg_catalog.int2[])))::pg_catalog.text, \
-       (a.attidentity OPERATOR(pg_catalog.<>) ''::pg_catalog.\"char\" \
-        OR a.attgenerated OPERATOR(pg_catalog.<>) ''::pg_catalog.\"char\" \
-        OR pg_catalog.strpos(COALESCE(pg_catalog.pg_get_expr(d.adbin, d.adrelid), \
-             ''::pg_catalog.text), 'nextval('::pg_catalog.text) OPERATOR(pg_catalog.=) 1)::pg_catalog.text \
-FROM pg_catalog.pg_attribute a \
-JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) a.attrelid \
-JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
-LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid OPERATOR(pg_catalog.=) a.attrelid \
-  AND d.adnum OPERATOR(pg_catalog.=) a.attnum \
-WHERE n.nspname::pg_catalog.text OPERATOR(pg_catalog.=) $4::pg_catalog.text \
-  AND c.relname::pg_catalog.text OPERATOR(pg_catalog.=) $5::pg_catalog.text \
-  AND a.attnum OPERATOR(pg_catalog.>) 0::pg_catalog.int2 AND NOT a.attisdropped \
-  AND ($1::pg_catalog.text IS NULL OR a.attname::pg_catalog.text OPERATOR(pg_catalog.~~) \
-       pg_catalog.like_escape($1::pg_catalog.text, '!'::pg_catalog.text)) \
-  AND ($2::pg_catalog.int4 IS NULL OR a.attnum::pg_catalog.int4 OPERATOR(pg_catalog.>) $2::pg_catalog.int4) \
-ORDER BY a.attnum LIMIT $3::pg_catalog.int8";
-
-const ROUTINES_SQL: &str = "\
-SELECT r.name, r.comment FROM ( \
-  SELECT pg_catalog.concat(p.proname::pg_catalog.text, '('::pg_catalog.text, \
-           pg_catalog.pg_get_function_identity_arguments(p.oid), ')'::pg_catalog.text) AS name, \
-         pg_catalog.obj_description(p.oid, 'pg_proc'::pg_catalog.name) AS comment, \
-         p.proname::pg_catalog.text AS proname \
-  FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n \
-    ON n.oid OPERATOR(pg_catalog.=) p.pronamespace \
-  WHERE n.nspname::pg_catalog.text OPERATOR(pg_catalog.=) $4::pg_catalog.text \
-    AND p.prokind OPERATOR(pg_catalog.=) ANY('{f,p}'::pg_catalog.\"char\"[])) r \
-WHERE ($1::pg_catalog.text IS NULL OR r.proname OPERATOR(pg_catalog.~~) \
-       pg_catalog.like_escape($1::pg_catalog.text, '!'::pg_catalog.text)) \
-  AND ($2::pg_catalog.text IS NULL OR r.name COLLATE pg_catalog.\"C\" \
-       OPERATOR(pg_catalog.>) $2::pg_catalog.text COLLATE pg_catalog.\"C\") \
-ORDER BY r.name COLLATE pg_catalog.\"C\" LIMIT $3::pg_catalog.int8";
-
-fn segment(parent: &ObjectPath, idx: usize, kinds: &[ObjectKind]) -> DriverResult<String> {
-    parent
-        .0
-        .get(idx)
-        .filter(|s| kinds.contains(&s.kind))
-        .map(|s| s.name.clone())
-        .ok_or_else(|| DriverError::InvalidParams("unexpected object path".into()))
-}
-
-fn cell(row: &[Option<String>], i: usize) -> Option<String> {
-    row.get(i).cloned().flatten()
-}
-
-fn truthy(row: &[Option<String>], i: usize) -> bool {
-    cell(row, i).as_deref() == Some("true")
-}
-
-#[async_trait::async_trait]
-impl Metadata for PgMetadata {
-    fn child_kinds(&self, parent: Option<ObjectKind>) -> Vec<ObjectKind> {
-        match parent {
-            None => vec![ObjectKind::Schema],
-            Some(ObjectKind::Schema) => vec![
-                ObjectKind::Table,
-                ObjectKind::View,
-                ObjectKind::MaterializedView,
-                ObjectKind::Routine,
-            ],
-            Some(ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView) => {
-                vec![ObjectKind::Column]
-            }
-            Some(_) => Vec::new(),
-        }
-    }
-
-    async fn list(
-        &self,
-        parent: &ObjectPath,
-        kind: ObjectKind,
-        page: PageRequest,
-    ) -> DriverResult<Page<ObjectInfo>> {
-        let limit = page.limit.clamp(1, 10_000);
-        let filter = page.filter.as_deref().map(|f| escape_like(f, '!'));
-        let fetch = (u64::from(limit) + 1).to_string();
-        let mut params = vec![filter, page.cursor.clone(), Some(fetch)];
-        let sql = match (parent.kind(), kind) {
-            (None, ObjectKind::Schema) => SCHEMAS_SQL,
-            (
-                Some(ObjectKind::Schema),
-                ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView,
-            ) => {
-                params.push(Some(segment(parent, 0, &[ObjectKind::Schema])?));
-                params.push(Some(
-                    match kind {
-                        ObjectKind::Table => "{r,p,f}",
-                        ObjectKind::View => "{v}",
-                        _ => "{m}",
-                    }
-                    .to_owned(),
-                ));
-                RELATIONS_SQL
-            }
-            (Some(ObjectKind::Schema), ObjectKind::Routine) => {
-                params.push(Some(segment(parent, 0, &[ObjectKind::Schema])?));
-                ROUTINES_SQL
-            }
-            (
-                Some(ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView),
-                ObjectKind::Column,
-            ) => {
-                params.push(Some(segment(parent, 0, &[ObjectKind::Schema])?));
-                params.push(Some(segment(
-                    parent,
-                    1,
-                    &[
-                        ObjectKind::Table,
-                        ObjectKind::View,
-                        ObjectKind::MaterializedView,
-                    ],
-                )?));
-                if let Some(c) = &page.cursor
-                    && c.parse::<i32>().is_err()
-                {
-                    return Err(DriverError::InvalidParams("invalid page cursor".into()));
-                }
-                COLUMNS_SQL
-            }
-            _ => return Err(DriverError::Unsupported(Feature::Metadata(kind))),
-        };
-        // The server sends at most `limit + 1` rows (the extra one tells whether a next page
-        // exists), and the text sink caps rows and bytes on top.
-        let max_rows = i32::try_from(limit).unwrap_or(i32::MAX).saturating_add(1);
-        let mut rows = self.link.internal(sql, params, max_rows).await?;
-        let more = rows.len() > limit as usize;
-        rows.truncate(limit as usize);
-        let mut items = Vec::with_capacity(rows.len());
-        let mut next_cursor = None;
-        for row in &rows {
-            let name = cell(row, 0).unwrap_or_default();
-            let comment = cell(row, 1);
-            let details = match kind {
-                ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView => {
-                    let mut t = TableInfo::default();
-                    t.estimated_rows = cell(row, 2)
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .and_then(|v| u64::try_from(v).ok());
-                    t.flavour = match cell(row, 3).as_deref() {
-                        Some("p") => Some("partitioned".to_owned()),
-                        Some("f") => Some("foreign".to_owned()),
-                        _ => None,
-                    };
-                    ObjectDetails::Table(t)
-                }
-                ObjectKind::Column => {
-                    let ordinal = cell(row, 2).and_then(|v| v.parse().ok()).unwrap_or(0);
-                    let mut c = ColumnInfo::new(ordinal, cell(row, 3).unwrap_or_default());
-                    c.nullable = truthy(row, 4);
-                    c.default = cell(row, 5);
-                    c.primary_key = truthy(row, 6);
-                    c.auto_generated = truthy(row, 7);
-                    next_cursor = Some(ordinal.to_string());
-                    ObjectDetails::Column(c)
-                }
-                _ => ObjectDetails::None,
-            };
-            if kind != ObjectKind::Column {
-                next_cursor = Some(name.clone());
-            }
-            items.push(ObjectInfo {
-                path: parent.child(kind, name),
-                comment,
-                details,
-            });
-        }
-        Ok(Page {
-            items,
-            next_cursor: if more { next_cursor } else { None },
-        })
-    }
-
-    async fn ddl(&self, _object: &ObjectPath) -> DriverResult<String> {
-        Err(DriverError::Unsupported(Feature::Ddl))
     }
 }
 

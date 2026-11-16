@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ninesql_driver_api::dialect::{classify_with_rules, split_with_rules};
 use ninesql_driver_api::{
-    Dialect, DriverError, DriverResult, ExplainFormat, LexicalRules, Param, RowChange, RowEdit,
-    ScriptItem, ScriptItemKind, ScriptRefusal, ScriptState, Statement, StatementClass,
-    StatementSpan, TextPosition, script_items, script_items_from,
+    CodeTokenKind, Dialect, DriverError, DriverResult, ExplainFormat, LexicalRules, Param,
+    RowChange, RowEdit, ScriptItem, ScriptItemKind, ScriptRefusal, ScriptState, Statement,
+    StatementClass, StatementSpan, TextPosition, code_tokens, script_items, script_items_from,
 };
 
 /// The session's lexical modes, shared between the session and its dialect.
@@ -69,6 +69,10 @@ pub struct MyDialect {
     modes: Arc<Modes>,
     /// `EXPLAIN ANALYZE` is offered (MySQL ≥ 8.0.18; MariaDB spells it `ANALYZE`).
     explain_analyze: bool,
+    /// TiDB (P4-C): `EXPLAIN FORMAT = 'tidb_json'`, and TiDB's executable comments
+    /// `/*T![feature] … */`, which the shared lexer reads as plain comments, make a statement
+    /// `Unknown`.
+    tidb: bool,
 }
 
 impl MyDialect {
@@ -78,6 +82,17 @@ impl MyDialect {
         Self {
             modes: Arc::default(),
             explain_analyze: true,
+            tidb: false,
+        }
+    }
+
+    /// The TiDB dialect (MySQL's, with TiDB's explain formats and executable comments).
+    #[must_use]
+    pub fn tidb() -> Self {
+        Self {
+            modes: Arc::default(),
+            explain_analyze: true,
+            tidb: true,
         }
     }
 
@@ -87,6 +102,7 @@ impl MyDialect {
         Self {
             modes: Arc::default(),
             explain_analyze: false,
+            tidb: false,
         }
     }
 
@@ -100,13 +116,15 @@ impl MyDialect {
         Self {
             modes: Arc::new(modes),
             explain_analyze: self.explain_analyze,
+            tidb: self.tidb,
         }
     }
 
-    pub(crate) fn tracking(modes: Arc<Modes>, explain_analyze: bool) -> Self {
+    pub(crate) fn tracking(modes: Arc<Modes>, explain_analyze: bool, tidb: bool) -> Self {
         Self {
             modes,
             explain_analyze,
+            tidb,
         }
     }
 
@@ -148,6 +166,45 @@ impl MyDialect {
     }
 }
 
+/// Functions of MySQL, MariaDB and TiDB with side effects a `SELECT` can call, on top of the
+/// shared list (which has `NEXTVAL` / `SETVAL`): sequence access (`LASTVAL` is over-classified
+/// with them) and user-level locks, which outlive the statement (security review L4).
+const MYSQL_SIDE_EFFECT_FUNCTIONS: &[&str] = &[
+    "nextval",
+    "setval",
+    "lastval",
+    "get_lock",
+    "release_lock",
+    "release_all_locks",
+];
+
+/// `Unknown` when `text` calls one of [`MYSQL_SIDE_EFFECT_FUNCTIONS`] or reads a sequence with
+/// `NEXT VALUE FOR` / `NEXTVAL FOR` (MariaDB, TiDB), `Read` otherwise.
+fn side_effects(text: &str, rules: LexicalRules) -> StatementClass {
+    let toks = code_tokens(text, rules);
+    let word = |i: usize, w: &str| toks.get(i).is_some_and(|t| t.is_word(text, w));
+    let hit = (0..toks.len()).any(|i| {
+        let t = &toks[i];
+        if t.kind != CodeTokenKind::Word {
+            return false;
+        }
+        let call = toks
+            .get(i + 1)
+            .is_some_and(|n| n.kind == CodeTokenKind::OpenParen)
+            && MYSQL_SIDE_EFFECT_FUNCTIONS
+                .iter()
+                .any(|f| t.text(text).eq_ignore_ascii_case(f));
+        call || (word(i, "NEXT") && word(i + 1, "VALUE") && word(i + 2, "FOR"))
+            || (word(i, "NEXTVAL") && word(i + 1, "FOR"))
+            || (word(i, "PREVIOUS") && word(i + 1, "VALUE") && word(i + 2, "FOR"))
+    });
+    if hit {
+        StatementClass::Unknown
+    } else {
+        StatementClass::Read
+    }
+}
+
 impl Dialect for MyDialect {
     fn lexical_rules(&self) -> LexicalRules {
         // With `ANSI_QUOTES`, `"…"` is an identifier without backslash escapes (the text is
@@ -181,7 +238,24 @@ impl Dialect for MyDialect {
     }
 
     fn classify(&self, text: &str) -> StatementClass {
-        classify_with_rules(&self.normalized(text), self.lexical_rules())
+        let normalized = self.normalized(text);
+        let rules = self.lexical_rules();
+        let class = classify_with_rules(&normalized, rules).max(side_effects(&normalized, rules));
+        // TiDB runs the content of `/*T! … */` (feature-gated executable comments) that the
+        // shared lexer skips as a comment: never classify such a text below `Unknown`.
+        // Compared as bytes: a comment may be followed by any character (security review H1).
+        if self.tidb
+            && scan(text, self.scan_rules()).iter().any(|seg| {
+                seg.kind == Seg::Comment
+                    && text
+                        .as_bytes()
+                        .get(seg.start..seg.start.saturating_add(4))
+                        .is_some_and(|b| b.eq_ignore_ascii_case(b"/*t!"))
+            })
+        {
+            return class.max(StatementClass::Unknown);
+        }
+        class
     }
 
     fn split_script(&self, script: &str) -> Vec<ScriptItem> {
@@ -255,6 +329,7 @@ impl Dialect for MyDialect {
         let q = query.trim().trim_end_matches(';');
         Some(match format {
             ExplainFormat::Text => format!("EXPLAIN {q}"),
+            ExplainFormat::Json if self.tidb => format!("EXPLAIN FORMAT = 'tidb_json' {q}"),
             ExplainFormat::Json => format!("EXPLAIN FORMAT=JSON {q}"),
             ExplainFormat::Analyze if self.explain_analyze => format!("EXPLAIN ANALYZE {q}"),
             _ => return None,
@@ -1076,7 +1151,7 @@ mod tests {
         let modes = Arc::new(Modes::default());
         modes.set_sql_mode("ANSI_QUOTES,NO_BACKSLASH_ESCAPES");
         conformance::assert_dialect_quoting_roundtrip(
-            &MyDialect::tracking(modes, true),
+            &MyDialect::tracking(modes, true, false),
             conformance::ALIAS_TEMPLATE,
             conformance::IDENTIFIER_SAMPLES,
         );
@@ -1085,7 +1160,7 @@ mod tests {
     #[test]
     fn sql_mode_drives_the_lexer() {
         let modes = Arc::new(Modes::default());
-        let d = MyDialect::tracking(Arc::clone(&modes), true);
+        let d = MyDialect::tracking(Arc::clone(&modes), true, false);
         // Default mode: `\'` escapes the quote, one statement holding a string.
         let sql = r"SELECT 'a\'; DELETE FROM t; -- '";
         assert_eq!(d.split_statements(sql).len(), 1);
@@ -1206,7 +1281,7 @@ mod tests {
         fn rewrite_keeps_length(text in "\\PC{0,80}") {
             let modes = Arc::new(Modes::default());
             modes.set_sql_mode("ANSI_QUOTES");
-            let d = MyDialect::tracking(modes, true);
+            let d = MyDialect::tracking(modes, true, false);
             let n = d.normalized(&text);
             prop_assert_eq!(n.len(), text.len());
             for s in d.split_statements(&text) {

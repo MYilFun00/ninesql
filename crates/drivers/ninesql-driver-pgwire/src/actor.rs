@@ -39,8 +39,9 @@ use postgres_protocol::message::{backend, frontend};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use crate::cancel::{CancelTarget, ExecCancel};
+use crate::cancel::{CancelTarget, ExecCancel, MetaGate};
 use crate::conn::{Conn, Msg, PgError, RowSink};
+use crate::engine::Flavor;
 use crate::types::{BatchBuilder, ColPlan, builtin_type_name, schema_for};
 
 /// Name of the prepared statement the driver uses for user statements.
@@ -65,16 +66,19 @@ pub(crate) struct Shared {
     /// The session is read-only (the engine-side setting must stay on).
     pub(crate) read_only: AtomicBool,
     pub(crate) major_version: Option<u32>,
+    /// The engine of the family the session was checked against at connect.
+    pub(crate) flavor: Flavor,
 }
 
 impl Shared {
-    pub(crate) fn new(major_version: Option<u32>, txn_status: u8) -> Self {
+    pub(crate) fn new(major_version: Option<u32>, txn_status: u8, flavor: Flavor) -> Self {
         Self {
             closed: AtomicBool::new(false),
             close_reason: Mutex::new(None),
             txn_status: AtomicU8::new(txn_status),
             read_only: AtomicBool::new(false),
             major_version,
+            flavor,
         }
     }
 
@@ -98,7 +102,9 @@ impl Shared {
     }
 
     pub(crate) fn in_transaction(&self) -> bool {
-        self.txn_status.load(Ordering::SeqCst) != b'I'
+        // QuestDB accepts `BEGIN` and may report a transaction block after DDL, but has no
+        // transactions in the PostgreSQL sense (none is declared).
+        self.flavor != Flavor::QuestDb && self.txn_status.load(Ordering::SeqCst) != b'I'
     }
 }
 
@@ -134,6 +140,12 @@ pub(crate) enum Command {
         sql: String,
         params: Vec<Option<String>>,
         max_rows: i32,
+        /// Largest value kept: `None` cuts values at 64 KiB silently; `Some(n)` fails the
+        /// statement when a value is longer than `n` (DDL text is never returned cut).
+        value_limit: Option<usize>,
+        /// Set for navigator statements: run inside a savepoint when a transaction is open,
+        /// cancellable only while the statement runs (security review M1).
+        gate: Option<Arc<MetaGate>>,
         verify: bool,
         guard: ExecutionGuard,
         reply: oneshot::Sender<DriverResult<Rows>>,
@@ -442,11 +454,22 @@ impl Actor {
                     sql,
                     params,
                     max_rows,
+                    value_limit,
+                    gate,
                     verify,
                     guard,
                     reply,
                 } => {
-                    let mut result = self.internal(&sql, &params, max_rows).await;
+                    let mut result = match &gate {
+                        Some(g) => {
+                            self.navigator_statement(&sql, &params, max_rows, value_limit, g)
+                                .await
+                        }
+                        None => {
+                            self.internal_limited(&sql, &params, max_rows, value_limit)
+                                .await
+                        }
+                    };
                     if result.is_ok()
                         && verify
                         && let Err(e) = self.verify_session().await
@@ -517,6 +540,72 @@ impl Actor {
         params: &[Option<String>],
         max_rows: i32,
     ) -> DriverResult<Rows> {
+        self.internal_limited(sql, params, max_rows, None).await
+    }
+
+    /// A navigator statement. In an open transaction it runs inside `SAVEPOINT ninesql_meta`,
+    /// released on success and rolled back to on any error or cancel, so neither a server
+    /// error nor the cancel of an abandoned call aborts the user's transaction (security
+    /// review M1). Savepoints are allowed in read-only transactions.
+    async fn navigator_statement(
+        &mut self,
+        sql: &str,
+        params: &[Option<String>],
+        max_rows: i32,
+        value_limit: Option<usize>,
+        gate: &MetaGate,
+    ) -> DriverResult<Rows> {
+        const SAVEPOINT: &str = "SAVEPOINT ninesql_meta";
+        const RELEASE: &str = "RELEASE SAVEPOINT ninesql_meta";
+        const ROLLBACK_TO: &str = "ROLLBACK TO SAVEPOINT ninesql_meta";
+        // QuestDB has no transactions (and no savepoints), whatever status it reports.
+        let in_tx = self.conn.txn_status == b'T' && self.shared.flavor != Flavor::QuestDb;
+        if in_tx {
+            self.internal(SAVEPOINT, &[], 0).await?;
+        }
+        let result = if gate.start() {
+            self.internal_limited(sql, params, max_rows, value_limit)
+                .await
+        } else {
+            Err(DriverError::Cancelled)
+        };
+        gate.stop();
+        if !in_tx {
+            return result;
+        }
+        // A cancel request sent while the statement ran can reach one of these statements
+        // instead: try again (the request is sent once).
+        for _ in 0..3 {
+            let step = if result.is_ok() && self.conn.txn_status == b'T' {
+                self.internal(RELEASE, &[], 0).await.map(|_| ())
+            } else {
+                match self.internal(ROLLBACK_TO, &[], 0).await {
+                    Ok(_) => self.internal(RELEASE, &[], 0).await.map(|_| ()),
+                    Err(e) => Err(e),
+                }
+            };
+            match step {
+                Ok(()) => return result,
+                Err(e) if e.is_fatal() => return Err(e),
+                Err(_) => {}
+            }
+        }
+        tracing::warn!("the navigator savepoint could not be released");
+        Err(DriverError::Query {
+            code: None,
+            message: "the navigator could not restore the open transaction".into(),
+            position: None,
+        })
+    }
+
+    /// [`internal`](Self::internal) with a value limit (see `Command::Internal`).
+    pub(crate) async fn internal_limited(
+        &mut self,
+        sql: &str,
+        params: &[Option<String>],
+        max_rows: i32,
+        value_limit: Option<usize>,
+    ) -> DriverResult<Rows> {
         let out = self.conn.out();
         let proto = |e: std::io::Error| DriverError::Protocol(e.to_string());
         frontend::parse("", sql, params.iter().map(|_| 0), out).map_err(proto)?;
@@ -542,6 +631,7 @@ impl Actor {
         frontend::sync(out);
         self.conn.flush().await?;
         let mut rows = crate::conn::TextRows::default();
+        rows.value_limit = value_limit;
         let mut error = None;
         loop {
             match self.conn.next(RowSink::Text(&mut rows)).await? {
@@ -553,6 +643,15 @@ impl Actor {
         self.sync_status();
         match error {
             Some(e) => Err(statement_error(&e, false)),
+            None if rows.overflow => Err(internal_overflow()),
+            None if rows.cut && value_limit.is_some() => Err(DriverError::Query {
+                code: None,
+                message: format!(
+                    "the definition is larger than {} KiB and was not loaded",
+                    value_limit.unwrap_or(0) / 1024
+                ),
+                position: None,
+            }),
             None => Ok(rows.rows),
         }
     }
@@ -577,6 +676,11 @@ impl Actor {
             )));
         }
         if !self.shared.read_only.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self.shared.flavor == Flavor::QuestDb {
+            // QuestDB's read-only user or read-only server: verified at connect, and no
+            // statement can lift it (`ServerSetting { liftable: false }`).
             return Ok(());
         }
         let on = match self.shared.major_version {
@@ -963,8 +1067,16 @@ impl Actor {
                 ))));
             ex.builder = Some(BatchBuilder::new(schema, plans, budget));
             let outside_txn = self.conn.txn_status == b'I';
-            ex.implicit_txn = outside_txn && ex.class == StatementClass::Read && !is_call;
-            ex.paged = !outside_txn || ex.implicit_txn;
+            if self.shared.flavor == Flavor::QuestDb {
+                // QuestDB has no transactions to hold a suspended portal (and no `set_config`):
+                // one `Execute`, read as the consumer asks (TCP back-pressure pauses the server);
+                // a dropped or cancelled read is cancelled server-side.
+                ex.implicit_txn = false;
+                ex.paged = false;
+            } else {
+                ex.implicit_txn = outside_txn && ex.class == StatementClass::Read && !is_call;
+                ex.paged = !outside_txn || ex.implicit_txn;
+            }
             self.bind_execute(params, &formats, ex)?;
             self.conn.flush().await?;
             self.fetch_loop(ex, reply).await
@@ -1312,6 +1424,18 @@ impl Actor {
 enum Filled {
     Batch,
     Finished,
+}
+
+/// A driver statement whose rows passed the internal byte cap: non-fatal (the rest of the
+/// result was read and dropped, the session and its transaction stay).
+pub(crate) fn internal_overflow() -> DriverError {
+    DriverError::Query {
+        code: None,
+        message: "the listing is larger than the driver's 32 MiB limit; use a smaller page or a \
+                  filter"
+            .into(),
+        position: None,
+    }
 }
 
 #[cfg(test)]
