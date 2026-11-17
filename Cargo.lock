@@ -4558,6 +4558,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -4695,6 +4696,7 @@ dependencies = [
 name = "ninesql-grid"
 version = "0.0.0"
 dependencies = [
+ "arrow-data",
  "gpui-kit",
  "gpui-pre",
  "ninesql-core",
@@ -4765,6 +4767,15 @@ dependencies = [
 [[package]]
 name = "ninesql-transfer"
 version = "0.0.0"
+dependencies = [
+ "libc",
+ "ninesql-driver-api",
+ "proptest",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "ninesql-ui"

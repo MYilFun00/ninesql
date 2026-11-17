@@ -43,7 +43,8 @@
 //! bounded queue without waiting: when the queue is full (a disk that does not keep up), the
 //! entry is dropped and counted ([`History::dropped`]). Queries, deletes and pruning go through
 //! the same queue and answer through a [`Reply`]. Retention ([`HistoryPreferences::retention`])
-//! is applied at start, every [`PRUNE_EVERY`] entries and when it changes.
+//! is applied at start, every [`PRUNE_EVERY`] entries and when it changes (after the inserts
+//! queued before the change).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -292,7 +293,9 @@ impl History {
                 .shared
                 .retention_changed
                 .store(true, Ordering::SeqCst);
-            // A full queue still holds jobs: the writer sees the flag at the next one.
+            // The `Wake` queues behind the inserts sent before the change, so they are pruned
+            // too. A full queue drops it: the writer then acts on the flag at the next job that
+            // is not an insert, and the periodic prune meanwhile reads the new retention.
             let _ = self.inner.jobs.try_send(Job::Wake);
         }
     }
@@ -417,10 +420,19 @@ fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, shared: &WriterShared) 
     };
     let _ = prune(&mut db);
     let mut since_prune = 0u64;
-    while let Ok(job) = jobs.recv() {
+    // A changed retention is applied at the `Wake` that `set_preferences` queues behind the
+    // inserts sent before it, or before any job that reads or answers (when a full queue
+    // dropped the `Wake`), never in the middle of earlier inserts: an insert queued before the
+    // change and written after the prune would leave one entry over the new limit.
+    let apply_changed_retention = |db: &mut HistoryDb, since_prune: &mut u64| {
         if shared.retention_changed.swap(false, Ordering::SeqCst) {
-            since_prune = 0;
-            let _ = prune(&mut db);
+            *since_prune = 0;
+            let _ = prune(db);
+        }
+    };
+    while let Ok(job) = jobs.recv() {
+        if !matches!(job, Job::Insert(_)) {
+            apply_changed_retention(&mut db, &mut since_prune);
         }
         match job {
             Job::Insert(entry) => {

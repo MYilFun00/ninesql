@@ -64,6 +64,7 @@
 //! with [`Dialect::split_script_from`] (contract on [`Dialect::split_script`]).
 
 use crate::capabilities::ExplainFormat;
+use crate::dml::{ColumnType, DmlError};
 use crate::error::{DriverError, DriverResult};
 use crate::statement::{Param, Statement};
 
@@ -818,7 +819,54 @@ pub trait Dialect: Send + Sync {
         classify_with_rules(text, self.lexical_rules())
     }
 
-    /// Renders a grid edit as a parameterized DML statement.
+    /// The typed literal of `value` for a DML preview or an SQL `INSERT` export
+    /// ([`crate::dml`]), for a column of type `ty`. It must read back as exactly the value the
+    /// bound parameter gives **in every lexical mode of the engine** (the text may be replayed
+    /// in another session, security review H1), and never show a character
+    /// [`needs_escape`](crate::dml::needs_escape) escapes raw. Default:
+    /// [`ansi_dml_literal`](crate::dml::ansi_dml_literal).
+    ///
+    /// # Errors
+    /// A reason (never the value) when the engine has no faithful literal or parameter for it.
+    fn dml_literal(&self, value: &Param, ty: &ColumnType) -> Result<String, &'static str> {
+        let _ = ty;
+        crate::dml::ansi_dml_literal(self.lexical_rules(), value)
+    }
+
+    /// Refuses a table or column name the engine would reject or silently change (truncation)
+    /// in generated DML. Default: [`check_identifier_basic`](crate::dml::check_identifier_basic)
+    /// (not empty, no NUL).
+    ///
+    /// # Errors
+    /// [`DmlError::InvalidIdentifier`].
+    fn dml_check_identifier(&self, name: &str) -> Result<(), DmlError> {
+        crate::dml::check_identifier_basic(name)
+    }
+
+    /// `true` when `col = value` matches exactly the rows whose column holds `value` for this
+    /// column type, so it may be part of a key or concurrency `WHERE`. Default: `true`.
+    fn dml_comparable(&self, ty: &ColumnType) -> bool {
+        let _ = ty;
+        true
+    }
+
+    /// The engine (at this server version) has unique keys whose `NULL`s are not distinct
+    /// (PostgreSQL 15+ `NULLS NOT DISTINCT`), so a `NULL` key value identifies one row.
+    /// [`KeyKind::Unique { nulls_distinct: false }`](crate::dml::KeyKind::Unique) is refused
+    /// when this is `false`. Default: `false`.
+    fn supports_unique_nulls_not_distinct(&self) -> bool {
+        false
+    }
+
+    /// `INSERT` of a row with every column at its default (`table` already quoted). Default:
+    /// `INSERT INTO <table> DEFAULT VALUES`.
+    fn dml_insert_default_values(&self, table: &str) -> String {
+        format!("INSERT INTO {table} DEFAULT VALUES")
+    }
+
+    /// Renders a grid edit as a parameterized DML statement. Prefer
+    /// [`dml::generate`](crate::dml::generate), which also checks editing capabilities, typed
+    /// keys, `NULL` keys and the result, and renders a preview.
     ///
     /// # Errors
     /// [`DriverError::InvalidParams`] when an update / delete has an empty key or an update has
@@ -1493,7 +1541,7 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "PG_ROTATE_LOGFILE",
     "PG_PROMOTE",
     "PG_SWITCH_WAL",
-    "PG_FILE_WRITE",
+    "PG_SWITCH_XLOG",
     "PG_START_BACKUP",
     "PG_STOP_BACKUP",
     "PG_DROP_REPLICATION_SLOT",
@@ -1504,6 +1552,20 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "PG_LOG_BACKEND_MEMORY_CONTEXTS",
     "PG_IMPORT_SYSTEM_COLLATIONS",
     "PG_STAT_STATEMENTS_RESET",
+    "PG_NOTIFY",
+    // Assign a transaction id to a read-only transaction (P5 security review L6).
+    "TXID_CURRENT",
+    "PG_CURRENT_XACT_ID",
+    // Index maintenance callable from a `SELECT` (P5 security review L6).
+    "BRIN_SUMMARIZE_NEW_VALUES",
+    "BRIN_SUMMARIZE_RANGE",
+    "BRIN_DESUMMARIZE_RANGE",
+    "GIN_CLEAN_PENDING_LIST",
+    // Server file access, the counterparts of MySQL's `LOAD_FILE` (P5 security review L5).
+    "PG_READ_FILE",
+    "PG_READ_BINARY_FILE",
+    "PG_STAT_FILE",
+    "PG_LOGDIR_LS",
     "LO_IMPORT",
     "LO_EXPORT",
     "LO_UNLINK",
@@ -1515,13 +1577,42 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "LO_TRUNCATE64",
     "LOWRITE",
     "LOAD_EXTENSION",
+    // WAL, replication and maintenance side effects (second P5 security review): a WAL record
+    // for the standby snapshot (PostgreSQL 16), failover slot sync on a standby (17), the
+    // pg_visibility map truncation (WAL-logged), the autoprewarm worker and dump file, the
+    // buffer cache loads and evictions of pg_prewarm and pg_buffercache (17, 18), pg_surgery's
+    // heap writes and the statistics writers of PostgreSQL 18.
+    "PG_LOG_STANDBY_SNAPSHOT",
+    "PG_SYNC_REPLICATION_SLOTS",
+    "PG_TRUNCATE_VISIBILITY_MAP",
+    "AUTOPREWARM_DUMP_NOW",
+    "AUTOPREWARM_START_WORKER",
+    "PG_PREWARM",
+    "PG_BUFFERCACHE_EVICT",
+    "PG_BUFFERCACHE_EVICT_RELATION",
+    "PG_BUFFERCACHE_EVICT_ALL",
+    "HEAP_FORCE_KILL",
+    "HEAP_FORCE_FREEZE",
+    "PG_RESTORE_RELATION_STATS",
+    "PG_RESTORE_ATTRIBUTE_STATS",
+    "PG_CLEAR_RELATION_STATS",
+    "PG_CLEAR_ATTRIBUTE_STATS",
 ];
 
 /// Prefixes of function families with side effects (F2): replication slots and origins,
 /// statistics resets, backups, WAL replay control, `dblink*`, `pg_create_*` (restore points,
-/// replication slots) and `pg_copy_*_replication_slot`. A few read-only members
-/// (`pg_replication_origin_oid`…) are over-classified, which only asks for confirmation.
+/// replication slots), `pg_copy_*_replication_slot`, advisory locks and unlocks
+/// (`pg_advisory_*`, `pg_try_advisory_*`: a session lock outlives the statement) and
+/// `pg_sleep*` (holds the session and its locks; P5 security review L5), server directory
+/// listings `pg_ls_*` (`pg_ls_dir`, `pg_ls_waldir`, `pg_ls_logdir`…) and adminpack's
+/// `pg_file_*` (`pg_file_write`, `pg_file_unlink`, `pg_file_rename`, `pg_file_sync`; P5
+/// security review L6), and the pre-10 `pg_xlog_replay_*`. A few read-only
+/// members (`pg_replication_origin_oid`…) are over-classified, which only asks for
+/// confirmation.
 const SIDE_EFFECT_PREFIXES: &[&str] = &[
+    "PG_ADVISORY_",
+    "PG_TRY_ADVISORY_",
+    "PG_SLEEP",
     "DBLINK",
     "PG_CREATE_",
     "PG_COPY_",
@@ -1529,6 +1620,9 @@ const SIDE_EFFECT_PREFIXES: &[&str] = &[
     "PG_BACKUP_",
     "PG_WAL_REPLAY_",
     "PG_REPLICATION_ORIGIN_",
+    "PG_XLOG_REPLAY_",
+    "PG_LS_",
+    "PG_FILE_",
 ];
 
 fn is_side_effect_function(upper: &str) -> bool {
@@ -2173,7 +2267,7 @@ fn classify_pragma(rest: &[Located]) -> StatementClass {
 // Literals
 
 /// Civil date from days since 1970-01-01 (proleptic Gregorian).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -2193,7 +2287,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// `^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$`
-fn is_strict_decimal(s: &str) -> bool {
+pub(crate) fn is_strict_decimal(s: &str) -> bool {
     fn digits(b: &[u8]) -> usize {
         b.iter().take_while(|c| c.is_ascii_digit()).count()
     }

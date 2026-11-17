@@ -333,6 +333,350 @@ SELECT lo_unlink(1234)
 expect: sqlite=Unknown
 SELECT load_extension('/tmp/x.so')
 
+%% P5 security review L5: locks, waits, notifications and server files, which used to read as
+%% Read and so passed the production confirmation, the edit filter check and the export rule.
+
+## pg_advisory_lock
+expect: pg=Unknown
+SELECT pg_advisory_lock(42)
+
+## pg_advisory_xact_lock_shared
+expect: pg=Unknown
+SELECT pg_advisory_xact_lock_shared(1, 2)
+
+## pg_try_advisory_lock in a where clause
+expect: pg=Unknown
+SELECT * FROM t WHERE pg_try_advisory_lock(id)
+
+## pg_advisory_unlock_all
+expect: pg=Unknown
+SELECT pg_advisory_unlock_all()
+
+## pg_notify
+expect: pg=Unknown
+SELECT pg_notify('chan', 'payload')
+
+## pg_sleep schema-qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_sleep(10)
+
+## pg_sleep quoted and qualified
+expect: pg=Unknown
+SELECT "pg_catalog"."pg_sleep"(10)
+
+## pg_sleep_for with a comment before the parenthesis
+expect: pg=Unknown
+SELECT pg_sleep_for /* x */ ('5 minutes')
+
+## pg_sleep as a from-item
+expect: pg=Unknown
+SELECT * FROM pg_sleep(1)
+
+## pg_cancel_backend qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_cancel_backend(42)
+
+## pg_reload_conf
+expect: pg=Unknown
+SELECT pg_reload_conf()
+
+## pg_rotate_logfile
+expect: pg=Unknown
+SELECT pg_rotate_logfile()
+
+## lo_import quoted
+expect: pg=Unknown
+SELECT "lo_import"('/etc/passwd')
+
+## lo_export
+expect: pg=Unknown
+SELECT lo_export(1234, '/tmp/x')
+
+## pg_read_file
+expect: pg=Unknown
+SELECT pg_read_file('/etc/passwd')
+
+## pg_read_binary_file qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_read_binary_file('postgresql.conf')
+
+## pg_ls_dir as a from-item
+expect: pg=Unknown
+SELECT * FROM pg_ls_dir('.')
+
+## pg_stat_file quoted
+expect: pg=Unknown
+SELECT "pg_stat_file"('postgresql.conf')
+
+## columns named like server file functions are reads
+expect: all=Read
+SELECT pg_read_file, t.pg_ls_dir, pg_stat_file FROM t
+
+## pg_ls_waldir (P5 security review L6)
+expect: pg=Unknown
+SELECT * FROM pg_ls_waldir()
+
+## pg_ls_logdir qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_ls_logdir()
+
+## pg_ls_tmpdir quoted and qualified
+expect: pg=Unknown
+SELECT "pg_catalog"."pg_ls_tmpdir"()
+
+## pg_ls_archive_statusdir
+expect: pg=Unknown
+SELECT name FROM pg_ls_archive_statusdir()
+
+## pg_file_unlink (adminpack)
+expect: pg=Unknown
+SELECT pg_file_unlink('x.log')
+
+## pg_file_rename qualified
+expect: pg=Unknown
+SELECT public.pg_file_rename('a', 'b')
+
+## pg_file_write quoted
+expect: pg=Unknown
+SELECT "pg_file_write"('x', 'data', false)
+
+## pg_file_sync
+expect: pg=Unknown
+SELECT pg_file_sync('x')
+
+## pg_logdir_ls
+expect: pg=Unknown
+SELECT * FROM pg_logdir_ls() AS a(f timestamp, n text)
+
+## brin_summarize_new_values
+expect: pg=Unknown
+SELECT brin_summarize_new_values('t_brin_idx')
+
+## brin_summarize_range qualified
+expect: pg=Unknown
+SELECT pg_catalog.brin_summarize_range('t_brin_idx', 0)
+
+## brin_desummarize_range quoted
+expect: pg=Unknown
+SELECT "brin_desummarize_range"('t_brin_idx', 0)
+
+## gin_clean_pending_list
+expect: pg=Unknown
+SELECT gin_clean_pending_list('t_gin_idx'::regclass)
+
+## txid_current assigns a transaction id
+expect: pg=Unknown
+SELECT txid_current()
+
+## pg_current_xact_id qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_current_xact_id()
+
+## pg_create_restore_point
+expect: pg=Unknown
+SELECT pg_create_restore_point('r1')
+
+## pg_switch_wal quoted
+expect: pg=Unknown
+SELECT "pg_switch_wal"()
+
+## pg_switch_xlog (before PostgreSQL 10)
+expect: pg=Unknown
+SELECT pg_switch_xlog()
+
+## pg_xlog_replay_pause (before PostgreSQL 10)
+expect: pg=Unknown
+SELECT pg_xlog_replay_pause()
+
+## pg_promote qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_promote(true, 60)
+
+## pg_create_logical_replication_slot
+expect: pg=Unknown
+SELECT * FROM pg_create_logical_replication_slot('s', 'pgoutput')
+
+## pg_create_physical_replication_slot quoted
+expect: pg=Unknown
+SELECT "pg_create_physical_replication_slot"('s')
+
+## pg_drop_replication_slot
+expect: pg=Unknown
+SELECT pg_drop_replication_slot('s')
+
+## pg_replication_origin_create
+expect: pg=Unknown
+SELECT pg_replication_origin_create('o')
+
+## pg_replication_origin_session_setup qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_replication_origin_session_setup('o')
+
+## pg_logical_emit_message
+expect: pg=Unknown
+SELECT pg_logical_emit_message(true, 'p', 'm')
+
+## nextval qualified
+expect: pg=Unknown
+SELECT pg_catalog.nextval('s')
+
+## setval in a where clause
+expect: pg=Unknown
+SELECT 1 WHERE setval('s', 1) > 0
+
+## columns named like the L6 functions are reads
+expect: all=Read
+SELECT pg_ls_waldir, t.pg_file_unlink, brin_summarize_range, t.gin_clean_pending_list, txid_current, t.pg_ls_logdir FROM t
+
+## qualified columns named like WAL and replication functions are reads
+expect: all=Read
+SELECT t.pg_switch_wal, t.pg_promote, t.pg_create_restore_point, t.nextval FROM t WHERE t.pg_file_write = 1
+
+## pg_log_standby_snapshot writes a WAL record
+expect: pg=Unknown
+SELECT pg_log_standby_snapshot()
+
+## pg_sync_replication_slots qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_sync_replication_slots()
+
+## pg_truncate_visibility_map (pg_visibility)
+expect: pg=Unknown
+SELECT pg_truncate_visibility_map('t'::regclass)
+
+## pg_truncate_visibility_map quoted and qualified
+expect: pg=Unknown
+SELECT "public"."pg_truncate_visibility_map"('t')
+
+## autoprewarm_dump_now
+expect: pg=Unknown
+SELECT autoprewarm_dump_now()
+
+## autoprewarm_start_worker quoted
+expect: pg=Unknown
+SELECT "autoprewarm_start_worker"()
+
+## pg_prewarm
+expect: pg=Unknown
+SELECT pg_prewarm('t', 'buffer')
+
+## pg_buffercache_evict
+expect: pg=Unknown
+SELECT pg_buffercache_evict(bufferid) FROM pg_buffercache
+
+## pg_buffercache_evict_relation qualified
+expect: pg=Unknown
+SELECT * FROM public.pg_buffercache_evict_relation('t')
+
+## pg_buffercache_evict_all
+expect: pg=Unknown
+SELECT * FROM pg_buffercache_evict_all()
+
+## heap_force_kill (pg_surgery)
+expect: pg=Unknown
+SELECT heap_force_kill('t'::regclass, ARRAY['(0, 1)']::tid[])
+
+## heap_force_freeze quoted
+expect: pg=Unknown
+SELECT "heap_force_freeze"('t'::regclass, ARRAY['(0, 1)']::tid[])
+
+## pg_restore_relation_stats
+expect: pg=Unknown
+SELECT pg_restore_relation_stats('schemaname', 'public', 'relname', 't', 'reltuples', 1::real)
+
+## pg_clear_attribute_stats qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_clear_attribute_stats('public', 't', 'a', false)
+
+## pg_stat_statements_reset
+expect: pg=Unknown
+SELECT pg_stat_statements_reset()
+
+## pg_stat_reset_shared quoted
+expect: pg=Unknown
+SELECT "pg_stat_reset_shared"('bgwriter')
+
+## columns named like the second-review functions are reads
+expect: all=Read
+SELECT pg_log_standby_snapshot, t.pg_sync_replication_slots, pg_truncate_visibility_map, t.autoprewarm_dump_now, autoprewarm_start_worker, pg_prewarm, t.pg_buffercache_evict, heap_force_kill, t.pg_clear_relation_stats FROM t
+
+## read-only pg_visibility and pg_buffercache functions are reads
+expect: pg=Read
+SELECT * FROM pg_visibility_map('t'), pg_check_visible('t'), pg_buffercache_summary(), pg_visibility_map_summary('t')
+
+## names that only start like a side-effect function are reads
+expect: all=Read
+SELECT pg_prewarm_status(1), pg_buffercache_evicted(1), heap_force_kill_count(1) FROM t
+
+## dblink qualified
+expect: pg=Unknown
+SELECT * FROM public.dblink('dbname=x', 'SELECT 1') AS r(a int)
+
+## set_config qualified
+expect: pg=ChangesAccessMode
+SELECT pg_catalog.set_config('default_transaction_read_only', 'off', false)
+
+## column named like a side-effect function is a read
+expect: all=Read
+SELECT pg_sleep, pg_notify, pg_advisory_lock, sleep, benchmark, load_file, get_lock FROM t
+
+## qualified column named like a side-effect function is a read
+expect: all=Read
+SELECT t.pg_sleep, t.sleep FROM t WHERE t.get_lock = 1
+
+## mysql sleep
+expect: my=Unknown
+SELECT SLEEP(5)
+
+## mysql sleep lower case in a where clause
+expect: my=Unknown
+SELECT * FROM t WHERE sleep(1) = 0
+
+## mysql sleep quoted
+expect: my=Unknown
+SELECT `sleep`(5)
+
+## mysql benchmark
+expect: my=Unknown
+SELECT BENCHMARK(1000000, MD5('x'))
+
+## mysql get_lock quoted
+expect: my=Unknown
+SELECT `GET_LOCK`('a', 10)
+
+## mysql release_lock
+expect: my=Unknown
+SELECT RELEASE_LOCK('a')
+
+## mysql load_file
+expect: my=Unknown
+SELECT LOAD_FILE('/etc/passwd')
+
+## mysql master_pos_wait
+expect: my=Unknown
+SELECT MASTER_POS_WAIT('binlog.000001', 4)
+
+## mysql source_pos_wait
+expect: my=Unknown
+SELECT SOURCE_POS_WAIT('binlog.000001', 4, 10)
+
+## mariadb master_gtid_wait
+expect: my=Unknown
+SELECT MASTER_GTID_WAIT('0-1-100', 10)
+
+## mysql sleep with a space before the parenthesis
+expect: my=Unknown
+SELECT SLEEP (5)
+
+## mysql sleep in ansi_quotes mode
+expect: my=Unknown
+modes: ansi_quotes
+SELECT "sleep"(5)
+
+## sqlite load_extension quoted
+expect: sqlite=Unknown
+SELECT "load_extension"('/tmp/x.so')
+
 ## user function is a read (documented limit L4)
 expect: all=Read
 SELECT my_function_that_writes(1)
