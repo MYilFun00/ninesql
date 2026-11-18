@@ -58,10 +58,11 @@
 //!   mapping, a file that is not a regular file or is over [`CsvLimits::max_file_bytes`], a file
 //!   inside NineSQL's own storage.
 //! - **Target table.** [`TransferService::import_target`] (and every import, before its
-//!   lease) reads the table's `TableInfo::transactional` through the metadata service: on a
-//!   non-transactional table only "commit every N rows" runs, every row sent stays whatever
-//!   the end, and the confirmation and the summary say rows cannot be rolled back
-//!   ([`ImportTarget`], [`ImportSummary::transactional`]).
+//!   lease) reads the table's `TableInfo::transactional` through the metadata service (a
+//!   cached listing that lacks the table is refreshed once, so a table created since it was
+//!   cached is found): on a non-transactional table only "commit every N rows" runs, every
+//!   row sent stays whatever the end, and the confirmation and the summary say rows cannot
+//!   be rolled back ([`ImportTarget`], [`ImportSummary::transactional`]).
 //! - **Confirmation (ADR-0007).** An import is a write. On a connection typed production, or
 //!   whose type confirms every write, the first call ends with
 //!   [`ImportEvent::NeedsConfirmation`] and a single-use [`ImportToken`] bound to the session,
@@ -1211,7 +1212,12 @@ impl TransferService {
         };
         let parent = ObjectPath(parents.to_vec());
         let found = self
-            .find_child(connection, NodeKey::new(parent, leaf.kind), &leaf.name)
+            .find_child(
+                connection,
+                NodeKey::new(parent, leaf.kind),
+                &leaf.name,
+                true,
+            )
             .await?;
         Ok(found.and_then(|o| match o.details {
             ObjectDetails::Table(t) => t.transactional,
@@ -1238,7 +1244,7 @@ impl TransferService {
                 .filter(|k| matches!(k, ObjectKind::Catalog | ObjectKind::Schema))
             {
                 if self
-                    .find_child(connection, NodeKey::new(path.clone(), kind), name)
+                    .find_child(connection, NodeKey::new(path.clone(), kind), name, false)
                     .await?
                     .is_some()
                 {
@@ -1262,26 +1268,44 @@ impl TransferService {
     }
 
     /// The child named `name` of a node, loading at most [`TARGET_MAX_PAGES`] more pages of
-    /// an incomplete listing.
+    /// an incomplete listing. When a complete listing does not hold the name, the node is
+    /// refreshed once and searched again: a cached listing predates a table created since
+    /// (for example by the user just before an import), which would otherwise read as
+    /// unknown storage and refuse "All or nothing" on the MySQL family. Only the table level
+    /// is refreshed (`refresh`): refreshing a container (the schema list) would discard the
+    /// whole loaded navigator tree for a mistyped schema name (review of the pre-phase-6
+    /// follow-ups, Low 3); a missing container still resolves to unknown storage.
     async fn find_child(
         &self,
         connection: crate::connection::ConnectionId,
         key: NodeKey,
         name: &str,
+        refresh: bool,
     ) -> Result<Option<ninesql_driver_api::metadata::ObjectInfo>, crate::metadata::MetadataError>
     {
         let find = |node: &NodeChildren| node.items.iter().find(|o| o.name() == name).cloned();
         let mut node = self.metadata.children(connection, key.clone()).await?;
-        for _ in 0..TARGET_MAX_PAGES {
+        let mut refreshed = false;
+        let mut pages = 0;
+        loop {
             if let Some(o) = find(&node) {
                 return Ok(Some(o));
             }
             if node.complete {
+                if refreshed || !refresh {
+                    return Ok(None);
+                }
+                refreshed = true;
+                pages = 0;
+                node = self.metadata.refresh(connection, key.clone()).await?;
+                continue;
+            }
+            if pages == TARGET_MAX_PAGES {
                 return Ok(None);
             }
+            pages += 1;
             node = self.metadata.load_more(connection, key.clone()).await?;
         }
-        Ok(find(&node))
     }
 
     fn issue_confirmation(&self, key: ImportKey) -> ImportToken {
