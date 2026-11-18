@@ -975,3 +975,167 @@ fn sql_insert_literals_survive_postgresql_lexical_modes() {
         "('plain')"
     );
 }
+
+/// P5-E M4 and L5: the confirmation says how the import commits and whether rows can be rolled
+/// back, and the token is bound to the CSV syntax and value options as well as the mode.
+#[test]
+fn import_confirmation_states_the_commit_mode_and_binds_csv_options() {
+    use ninesql_core::driver_api::{ObjectKind, ObjectPath};
+    use ninesql_core::transfer::{CsvFormat, ValueOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
+    let transfer = TransferService::new(manager.clone(), &paths(&tmp.path().join("ninesql")));
+    let data = tempfile::tempdir().unwrap();
+    let file = write_csv(data.path(), 10, None);
+    let mapping = ColumnMapping::by_position(3, &targets());
+    ui(async {
+        let types = ConnectionTypes::default();
+        let prod = open_ok(&manager, mock_connection(ConnectionTypeId::prod()), &types).await;
+        let table = vec!["nine".to_owned(), "public".to_owned(), "t000".to_owned()];
+        let path = ObjectPath::root()
+            .child(ObjectKind::Catalog, "nine")
+            .child(ObjectKind::Schema, "public")
+            .child(ObjectKind::Table, "t000");
+
+        // The target as the UI reads it before the import: found by name or by path.
+        for p in [None, Some(path.clone())] {
+            let t = transfer
+                .import_target(&prod, table.clone(), p)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(t.table_transactional(), Some(true));
+            assert!(t.rows_can_be_rolled_back() && t.all_or_nothing_allowed());
+            assert!(t.all_or_nothing_refusal().is_none());
+        }
+        // A path that names another table is refused.
+        let other = ObjectPath::root()
+            .child(ObjectKind::Catalog, "nine")
+            .child(ObjectKind::Schema, "public")
+            .child(ObjectKind::Table, "t001");
+        assert!(
+            transfer
+                .import_target(&prod, table.clone(), Some(other.clone()))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(matches!(
+            finish_import(
+                transfer.import_csv(
+                    &prod,
+                    ImportRequest::new(&file, table.clone(), targets(), mapping.clone())
+                        .with_table_path(other),
+                )
+            )
+            .await,
+            ImportOutcome::Refused(TransferJobError::Transfer(_))
+        ));
+        // A table the metadata does not list has unknown storage: on an engine whose tables
+        // are always transactional (not the MySQL family), rows can still be rolled back.
+        let t = transfer
+            .import_target(&prod, vec!["people".into()], None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.table_transactional(), None);
+        assert!(t.rows_can_be_rolled_back());
+
+        let request = ImportRequest::new(&file, table.clone(), targets(), mapping.clone())
+            .with_table_path(path.clone())
+            .with_transaction(ImportTransaction::CommitEvery(5));
+        let confirm = |o: ImportOutcome| match o {
+            ImportOutcome::Confirm(c) => c,
+            _ => panic!("needs confirmation"),
+        };
+        let c = confirm(finish_import(transfer.import_csv(&prod, request.clone())).await);
+        assert_eq!(c.transaction(), ImportTransaction::CommitEvery(5));
+        assert!(!c.non_transactional());
+        assert_eq!(c.target().table_transactional(), Some(true));
+        assert_eq!(
+            c.session_manual_commit(),
+            !prod.transaction_state().auto_commit
+        );
+
+        // L5: each CSV option changed after the confirmation invalidates the token.
+        let mut no_header = CsvFormat::default();
+        no_header.header = false;
+        let mut semicolon = CsvFormat::default();
+        semicolon.delimiter = b';';
+        let mut null_text = ValueOptions::default();
+        null_text.null_text = Some("NULL".into());
+        let mut empty_text = ValueOptions::default();
+        empty_text.empty_is_null = false;
+        let changed: Vec<ImportRequest> = vec![
+            request.clone().with_format(no_header),
+            request.clone().with_format(semicolon),
+            request.clone().with_values(null_text),
+            request.clone().with_values(empty_text),
+        ];
+        for changed in changed {
+            let c = confirm(finish_import(transfer.import_csv(&prod, request.clone())).await);
+            assert!(matches!(
+                finish_import(transfer.import_csv(&prod, changed.confirmed(c.token))).await,
+                ImportOutcome::Refused(TransferJobError::InvalidConfirmation)
+            ));
+        }
+        // The same request with its token runs.
+        let c = confirm(finish_import(transfer.import_csv(&prod, request.clone())).await);
+        let s = done(finish_import(transfer.import_csv(&prod, request.confirmed(c.token))).await);
+        assert_eq!(s.end, ImportEnd::Completed, "{:?}", s.error);
+        assert!(s.transactional);
+        assert_eq!(s.target.table_transactional(), Some(true));
+        assert_eq!(s.rows_committed, 10);
+    });
+}
+
+#[test]
+fn an_import_whose_rollback_fails_closes_the_session() {
+    // Security review of the P5-E fixes, Low 2: as a save whose undo failed, a failed import
+    // whose rollback also fails must not leave part of the import in an open transaction.
+    let tmp = tempfile::tempdir().unwrap();
+    let wrap = Wrap::new(mock_driver());
+    let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
+    let transfer = TransferService::new(manager.clone(), &paths(&tmp.path().join("ninesql")));
+    let data = tempfile::tempdir().unwrap();
+    ui(async {
+        let h = open_ok(
+            &manager,
+            mock_connection(ConnectionTypeId::dev()),
+            &ConnectionTypes::default(),
+        )
+        .await;
+        let bad = write_csv(data.path(), 1200, Some(700));
+        let mapping = transfer
+            .preview_csv(CsvPreviewRequest::new(&bad, targets()))
+            .await
+            .unwrap()
+            .unwrap()
+            .mapping;
+        wrap.fail_rollback
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let s = done(
+            finish_import(transfer.import_csv(
+                &h,
+                ImportRequest::new(
+                    &bad,
+                    vec!["public".to_owned(), "people".to_owned()],
+                    targets(),
+                    mapping,
+                ),
+            ))
+            .await,
+        );
+        assert_eq!(s.end, ImportEnd::Failed);
+        assert_eq!(s.rows_committed, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !h.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session was not closed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(h.commit().await.is_none_or(|r| r.is_err()));
+    });
+}

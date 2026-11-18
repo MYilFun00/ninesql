@@ -13,10 +13,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use ninesql_core::driver_api::metadata::ObjectPath;
 use ninesql_core::transfer::{ColumnMapping, CsvFormat, CsvPreview, MappedColumn, TargetColumn};
 use ninesql_core::{
     CsvPreviewRequest, ImportConfirmation, ImportEnd, ImportEvent, ImportRequest, ImportSummary,
-    ImportToken, ImportTransaction, SessionHandle, TransferService,
+    ImportTarget, ImportToken, ImportTransaction, SessionHandle, TransferService,
 };
 
 use super::{bytes_text, error_text, session_problem};
@@ -58,13 +59,23 @@ pub struct ImportCsvDialog {
     session: SessionHandle,
     transfer: TransferService,
     table: Vec<String>,
+    /// The table's navigator path, when the dialog was opened from the navigator.
+    table_path: Option<ObjectPath>,
     targets: Vec<TargetColumn>,
+    /// What the core says about rolling back rows in the table ([`ImportTarget`]), read once
+    /// off the UI thread when the dialog opens; `None` until it answers.
+    target: Option<ImportTarget>,
+    /// Why the target could not be read, if so.
+    target_error: Option<String>,
     path: Entity<InputState>,
     header: bool,
     preview: Option<CsvPreview>,
     /// `mapping[target] = Some(file field)`.
     mapping: Vec<Option<usize>>,
     transaction: ImportTransaction,
+    /// The commit mode of the last import started (the summary's wording follows it, not the
+    /// option shown now).
+    ran_with: ImportTransaction,
     skip_invalid: bool,
     stage: ImportStage,
     /// The statement of the confirmation, laid out once ([`ScriptRows`]).
@@ -73,32 +84,88 @@ pub struct ImportCsvDialog {
 }
 
 impl ImportCsvDialog {
-    /// A dialog importing into `table` (its `targets` columns, from the metadata cache).
+    /// A dialog importing into `table` (its `targets` columns, from the metadata cache;
+    /// `table_path`: its navigator path, when known). Asks the core at once, off the UI
+    /// thread, whether "All or nothing" is allowed for the table ([`Self::target`]).
     pub fn new(
         session: SessionHandle,
         transfer: TransferService,
         table: Vec<String>,
+        table_path: Option<ObjectPath>,
         targets: Vec<TargetColumn>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let path = cx.new(|cx| InputState::new(window, cx).placeholder("/home/me/data.csv"));
         let mapping = vec![None; targets.len()];
+        // Never blocks: the core reads the table's storage on the driver runtime.
+        let reply = transfer.import_target(&session, table.clone(), table_path.clone());
+        let read_target = cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(reply).await;
+            let _ = this.update(cx, |d, cx| d.set_target(result, cx));
+        });
         Self {
             session,
             transfer,
             table,
+            table_path,
+            target: None,
+            target_error: None,
             targets,
             path,
             header: true,
             preview: None,
             mapping,
             transaction: ImportTransaction::AllOrNothing,
+            ran_with: ImportTransaction::AllOrNothing,
             skip_invalid: false,
             stage: ImportStage::ChooseFile,
             confirm_script: None,
-            tasks: Vec::new(),
+            tasks: vec![read_target],
         }
+    }
+
+    /// The core's answer about the table ([`TransferService::import_target`]): when "All or
+    /// nothing" is not allowed, the mode moves to "commit every N rows" and the reason is shown.
+    fn set_target(
+        &mut self,
+        result: Option<Result<ImportTarget, ninesql_core::TransferJobError>>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Some(Ok(target)) => {
+                self.target = Some(target);
+                self.target_error = None;
+                if !target.all_or_nothing_allowed()
+                    && self.transaction == ImportTransaction::AllOrNothing
+                {
+                    self.transaction = ImportTransaction::CommitEvery(COMMIT_EVERY_ROWS);
+                }
+            }
+            Some(Err(e)) => self.target_error = Some(error_text(&e)),
+            None => self.target_error = Some("The table's storage could not be read.".into()),
+        }
+        cx.notify();
+    }
+
+    /// What the core said about rolling back rows in the table, once it answered.
+    #[must_use]
+    pub fn target(&self) -> Option<ImportTarget> {
+        self.target
+    }
+
+    /// The chosen commit mode.
+    #[must_use]
+    pub fn transaction(&self) -> ImportTransaction {
+        self.transaction
+    }
+
+    /// Why "All or nothing" is not offered for this table, if it is not (I8).
+    #[must_use]
+    pub fn all_or_nothing_refusal(&self) -> Option<String> {
+        self.target?
+            .all_or_nothing_refusal()
+            .map(|e| error_text(&e))
     }
 
     /// The stage.
@@ -146,8 +213,16 @@ impl ImportCsvDialog {
         cx.notify();
     }
 
-    /// "All or nothing" (one transaction) or "commit every N rows".
+    /// "All or nothing" (one transaction) or "commit every N rows". "All or nothing" is refused
+    /// with its reason when the table cannot roll back ([`Self::all_or_nothing_refusal`]).
     pub fn set_transaction(&mut self, t: ImportTransaction, cx: &mut Context<Self>) {
+        if t == ImportTransaction::AllOrNothing
+            && let Some(why) = self.all_or_nothing_refusal()
+        {
+            self.stage = ImportStage::Failed(why);
+            cx.notify();
+            return;
+        }
         self.transaction = t;
         cx.notify();
     }
@@ -275,12 +350,17 @@ impl ImportCsvDialog {
         if let Err(e) = self.column_mapping().validate(&self.targets) {
             return Some(crate::browse::display_message(&e.to_string()));
         }
+        if self.transaction == ImportTransaction::AllOrNothing
+            && let Some(why) = self.all_or_nothing_refusal()
+        {
+            return Some(why);
+        }
         None
     }
 
     fn request(&self, cx: &App) -> ImportRequest {
         let path = PathBuf::from(self.path.read(cx).value().trim());
-        ImportRequest::new(
+        let request = ImportRequest::new(
             path,
             self.table.clone(),
             self.targets.clone(),
@@ -288,7 +368,11 @@ impl ImportCsvDialog {
         )
         .with_format(self.format())
         .with_transaction(self.transaction)
-        .skipping_invalid_rows(self.skip_invalid)
+        .skipping_invalid_rows(self.skip_invalid);
+        match &self.table_path {
+            Some(p) => request.with_table_path(p.clone()),
+            None => request,
+        }
     }
 
     /// "Import": runs, or stops at the core's confirmation.
@@ -326,6 +410,7 @@ impl ImportCsvDialog {
             cx.notify();
             return;
         }
+        self.ran_with = self.transaction;
         // Never blocks: the core runs the import on the driver runtime.
         let mut job = self.transfer.import_csv(&self.session, request);
         self.stage = ImportStage::Running {
@@ -396,9 +481,19 @@ impl ImportCsvDialog {
             ImportStage::Running { .. } | ImportStage::Previewing
         ) {
             self.tasks.clear();
-            self.stage = ImportStage::Failed(match self.transaction {
+            let running = matches!(self.stage, ImportStage::Running { .. });
+            self.stage = ImportStage::Failed(match self.ran_with {
+                _ if !running => "Cancelled: the preview was stopped.".into(),
                 ImportTransaction::AllOrNothing => {
                     "Cancelled: the import's transaction is rolled back.".into()
+                }
+                _ if self
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| !t.rows_can_be_rolled_back()) =>
+                {
+                    "Cancelled: every row sent so far stays in the table (it cannot roll back)."
+                        .into()
                 }
                 _ => "Cancelled: rows of the batches already committed stay in the table.".into(),
             });
@@ -409,7 +504,7 @@ impl ImportCsvDialog {
     /// The lines of the confirmation, exactly as the core gave them.
     #[must_use]
     pub fn confirmation_lines(c: &ImportConfirmation) -> Vec<(String, String)> {
-        vec![
+        let mut lines = vec![
             (
                 "Connection".into(),
                 format!(
@@ -435,7 +530,35 @@ impl ImportCsvDialog {
                     bytes_text(c.file_bytes)
                 ),
             ),
-        ]
+        ];
+        let (commit, when) = match c.transaction() {
+            ImportTransaction::AllOrNothing => (
+                "All or nothing: one transaction, committed at the end".to_owned(),
+                "at the end".to_owned(),
+            ),
+            ImportTransaction::CommitEvery(n) => (
+                format!("A commit every {n} rows: rows committed before an error stay"),
+                format!("every {n} rows"),
+            ),
+            _ => (
+                "Committed by the import".to_owned(),
+                "by batches".to_owned(),
+            ),
+        };
+        lines.push(("Commits".into(), commit));
+        if c.session_manual_commit() {
+            lines.push((
+                "Note".into(),
+                format!("Rows are committed by the import ({when}); Roll back cannot undo them."),
+            ));
+        }
+        if c.non_transactional() {
+            lines.push((
+                "Note".into(),
+                "This table cannot roll back: rows written before a failure stay.".into(),
+            ));
+        }
+        lines
     }
 
     /// The statement of the confirmation, whole (never cut), as the confirmation shows it.
@@ -446,10 +569,70 @@ impl ImportCsvDialog {
             .flatten()
     }
 
-    /// The summary lines of a finished import.
+    /// The commit mode of the last import started (what its summary describes).
     #[must_use]
-    pub fn summary_lines(s: &ImportSummary) -> Vec<String> {
-        let end = match s.end {
+    pub fn ran_with(&self) -> ImportTransaction {
+        self.ran_with
+    }
+
+    /// The summary lines of a finished import run in commit mode `mode`.
+    #[must_use]
+    pub fn summary_lines(s: &ImportSummary, mode: ImportTransaction) -> Vec<String> {
+        let mut lines = SummaryFacts::of(s).lines(mode);
+        if s.issues_total > 0 {
+            lines.push(format!("{} issue(s):", s.issues_total));
+            lines.extend(s.issues.iter().take(50).map(|i| i.describe()));
+        }
+        lines
+    }
+}
+
+/// What the summary of an import says, apart from its issues ([`ImportCsvDialog::summary_lines`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryFacts {
+    /// How it ended.
+    pub end: ImportEnd,
+    /// The error's text, if one stopped it.
+    pub error: Option<String>,
+    /// Data rows read.
+    pub rows_read: u64,
+    /// Rows the database accepted.
+    pub rows_inserted: u64,
+    /// Rows committed and kept.
+    pub rows_committed: u64,
+    /// Invalid rows skipped.
+    pub rows_skipped: u64,
+    /// Rows not committed could be rolled back: the import ran in transactions on a table
+    /// that rolls back ([`ImportSummary::transactional`] and [`ImportSummary::target`]).
+    pub transactional: bool,
+    /// Wall-clock seconds.
+    pub elapsed_secs: f64,
+}
+
+impl SummaryFacts {
+    /// The facts of a core summary.
+    #[must_use]
+    pub fn of(s: &ImportSummary) -> Self {
+        Self {
+            end: s.end,
+            error: s.error.as_ref().map(error_text),
+            rows_read: s.rows_read,
+            rows_inserted: s.rows_inserted,
+            rows_committed: s.rows_committed,
+            rows_skipped: s.rows_skipped,
+            // A table that cannot roll back (or an engine without transactions) keeps every
+            // row it accepted: never worded as rolled back.
+            transactional: s.transactional && s.target.rows_can_be_rolled_back(),
+            elapsed_secs: s.elapsed.as_secs_f64(),
+        }
+    }
+
+    /// The lines, worded from the commit mode the user chose (`mode`): what was committed is
+    /// said first, so a "commit every N rows" import that stopped never reads as rolled back
+    /// entirely. Matches docs/tutorials/export-import.md §5 step 7.
+    #[must_use]
+    pub fn lines(&self, mode: ImportTransaction) -> Vec<String> {
+        let end = match self.end {
             ImportEnd::Completed => "Import completed",
             ImportEnd::Cancelled => "Import cancelled",
             ImportEnd::Failed => "Import failed",
@@ -457,26 +640,37 @@ impl ImportCsvDialog {
         };
         let mut lines = vec![format!(
             "{end}: {} rows read, {} inserted, {} committed, {} skipped, in {:.1} s.",
-            s.rows_read,
-            s.rows_inserted,
-            s.rows_committed,
-            s.rows_skipped,
-            s.elapsed.as_secs_f64()
+            self.rows_read,
+            self.rows_inserted,
+            self.rows_committed,
+            self.rows_skipped,
+            self.elapsed_secs
         )];
-        if let Some(e) = &s.error {
-            lines.push(error_text(e));
+        if let Some(e) = &self.error {
+            lines.push(e.clone());
         }
-        if s.end != ImportEnd::Completed && s.transactional {
-            lines.push("The transaction was rolled back: nothing was written.".into());
-        } else if s.end != ImportEnd::Completed && s.rows_committed > 0 {
+        if self.end == ImportEnd::Completed {
+            return lines;
+        }
+        // Rows inserted after the last commit, rolled back with the open batch.
+        let uncommitted = self.rows_inserted.saturating_sub(self.rows_committed);
+        if self.rows_committed > 0 {
             lines.push(format!(
                 "{} rows were committed before the end and stay in the table.",
-                s.rows_committed
+                self.rows_committed
             ));
-        }
-        if s.issues_total > 0 {
-            lines.push(format!("{} issue(s):", s.issues_total));
-            lines.extend(s.issues.iter().take(50).map(|i| i.describe()));
+            if self.transactional && uncommitted > 0 {
+                lines.push(format!(
+                    "The {uncommitted} rows inserted after the last commit were rolled back."
+                ));
+            }
+        } else {
+            lines.push(match mode {
+                ImportTransaction::AllOrNothing if self.transactional => {
+                    "The transaction was rolled back: nothing was written.".into()
+                }
+                _ => "No rows were committed before the end: nothing was written.".into(),
+            });
         }
         lines
     }
@@ -490,6 +684,7 @@ impl Render for ImportCsvDialog {
             ImportStage::Running { .. } | ImportStage::Previewing
         );
         let table = crate::browse::display_name(&self.table.join("."));
+        let refusal = self.all_or_nothing_refusal();
         let mut body = v_flex()
             .gap_2()
             .text_sm()
@@ -603,7 +798,9 @@ impl Render for ImportCsvDialog {
                                     }
                                     _ => "Transaction mode".to_owned(),
                                 })
-                                .disabled(running)
+                                // Only "commit every N rows" when the table cannot roll back.
+                                .disabled(running || refusal.is_some())
+                                .when_some(refusal.clone(), |b, why| b.tooltip(why))
                                 .on_click(cx.listener(|d, _, _, cx| {
                                     let next = match d.transaction {
                                         ImportTransaction::AllOrNothing => {
@@ -628,7 +825,23 @@ impl Render for ImportCsvDialog {
                                     d.set_skip_invalid(v, cx);
                                 })),
                         ),
-                );
+                )
+                .when_some(refusal, |d, why| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.warning)
+                            .child(format!("\"All or nothing\" is not offered: {why}")),
+                    )
+                })
+                .when_some(self.target_error.clone(), |d, why| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("The table's storage could not be checked: {why}")),
+                    )
+                });
         }
         body = match &self.stage {
             ImportStage::ChooseFile | ImportStage::Preview => body,
@@ -670,9 +883,11 @@ impl Render for ImportCsvDialog {
                 bytes_text(*bytes),
                 bytes_text(*file_bytes)
             )),
-            ImportStage::Done(s) => {
-                body.children(Self::summary_lines(s).into_iter().map(|l| div().child(l)))
-            }
+            ImportStage::Done(s) => body.children(
+                Self::summary_lines(s, self.ran_with)
+                    .into_iter()
+                    .map(|l| div().child(l)),
+            ),
             ImportStage::Failed(why) => {
                 body.child(div().text_color(theme.danger).child(why.clone()))
             }
@@ -733,11 +948,13 @@ pub fn open_import_dialog(
     session: SessionHandle,
     transfer: TransferService,
     table: Vec<String>,
+    table_path: Option<ObjectPath>,
     targets: Vec<TargetColumn>,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ImportCsvDialog> {
-    let dialog = cx.new(|cx| ImportCsvDialog::new(session, transfer, table, targets, window, cx));
+    let dialog = cx
+        .new(|cx| ImportCsvDialog::new(session, transfer, table, table_path, targets, window, cx));
     let view = dialog.clone();
     window.open_dialog(cx, move |d, _, _| {
         d.title("Import CSV").w(px(720.)).child(view.clone())
@@ -758,4 +975,118 @@ pub fn targets_from(items: &[ninesql_core::driver_api::metadata::ObjectInfo]) ->
         .collect();
     cols.sort_by_key(|(o, _)| *o);
     cols.into_iter().map(|(_, c)| c).collect()
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use ninesql_core::{ImportEnd, ImportTransaction};
+
+    use super::{COMMIT_EVERY_ROWS, SummaryFacts};
+
+    fn facts(end: ImportEnd, inserted: u64, committed: u64) -> SummaryFacts {
+        SummaryFacts {
+            end,
+            error: (end == ImportEnd::Failed).then(|| "line 5501: not a number".into()),
+            rows_read: inserted + u64::from(end != ImportEnd::Completed),
+            rows_inserted: inserted,
+            rows_committed: committed,
+            rows_skipped: 0,
+            // PostgreSQL, MySQL and SQLite: transactional whatever the mode.
+            transactional: true,
+            elapsed_secs: 1.2,
+        }
+    }
+
+    const EVERY: ImportTransaction = ImportTransaction::CommitEvery(COMMIT_EVERY_ROWS);
+    const ROLLED_BACK: &str = "The transaction was rolled back: nothing was written.";
+
+    #[test]
+    fn success_says_only_the_counts_in_both_modes() {
+        for mode in [ImportTransaction::AllOrNothing, EVERY] {
+            assert_eq!(
+                facts(ImportEnd::Completed, 7000, 7000).lines(mode),
+                vec![
+                    "Import completed: 7000 rows read, 7000 inserted, 7000 committed, 0 skipped, in 1.2 s."
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn commit_every_failure_after_commits_never_says_rolled_back_entirely() {
+        let lines = facts(ImportEnd::Failed, 5500, 5000).lines(EVERY);
+        assert_eq!(
+            lines,
+            vec![
+                "Import failed: 5501 rows read, 5500 inserted, 5000 committed, 0 skipped, in 1.2 s.",
+                "line 5501: not a number",
+                "5000 rows were committed before the end and stay in the table.",
+                "The 500 rows inserted after the last commit were rolled back.",
+            ]
+        );
+        assert!(!lines.iter().any(|l| l == ROLLED_BACK));
+        // Cancelled the same way.
+        let lines = facts(ImportEnd::Cancelled, 2000, 2000).lines(EVERY);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("2000 rows were committed before the end and stay in the table.")
+        );
+    }
+
+    #[test]
+    fn commit_every_failure_before_any_commit() {
+        let lines = facts(ImportEnd::Failed, 600, 0).lines(EVERY);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("No rows were committed before the end: nothing was written.")
+        );
+        assert!(!lines.iter().any(|l| l == ROLLED_BACK));
+    }
+
+    #[test]
+    fn all_or_nothing_failure_rolls_everything_back() {
+        let lines = facts(ImportEnd::Failed, 5500, 0).lines(ImportTransaction::AllOrNothing);
+        assert_eq!(lines.last().map(String::as_str), Some(ROLLED_BACK));
+        assert_eq!(lines.len(), 3);
+        let lines = facts(ImportEnd::Cancelled, 10, 0).lines(ImportTransaction::AllOrNothing);
+        assert_eq!(
+            lines,
+            vec![
+                "Import cancelled: 11 rows read, 10 inserted, 0 committed, 0 skipped, in 1.2 s."
+                    .to_owned(),
+                ROLLED_BACK.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_transactional_table_is_never_said_rolled_back() {
+        let mut f = facts(ImportEnd::Failed, 0, 0);
+        f.transactional = false;
+        for mode in [ImportTransaction::AllOrNothing, EVERY] {
+            let lines = f.lines(mode);
+            assert!(
+                !lines.iter().any(|l| l.contains("rolled back")),
+                "{lines:?}"
+            );
+        }
+        let mut f = facts(ImportEnd::Cancelled, 1500, 1500);
+        f.transactional = false;
+        let lines = f.lines(EVERY);
+        assert!(
+            !lines.iter().any(|l| l.contains("rolled back")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn non_transactional_engine_keeps_every_inserted_row() {
+        let mut f = facts(ImportEnd::Failed, 300, 300);
+        f.transactional = false;
+        let lines = f.lines(EVERY);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("300 rows were committed before the end and stay in the table.")
+        );
+    }
 }
