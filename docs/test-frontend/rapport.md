@@ -1,6 +1,6 @@
 # Tests d’interface — session du 19 novembre 2026
 
-Passe visuelle partielle, sur la même machine que [les tests backend](../test-backend/README.md). Session Wayland, thème clair, échelle 200 %. Binaire de développement : `make run` a compilé le profil `dev` en 1 min 26 s, puis a lancé `target/debug/ninesql`.
+Passe visuelle partielle, sur la même machine que [les tests backend](../test-backend/rapport.md). Session Wayland, thème clair, échelle 200 %. Binaire de développement : `make run` a compilé le profil `dev` en 1 min 26 s, puis a lancé `target/debug/ninesql`.
 
 Une seule fenêtre NineSQL. Les bases de test du profil `core` étaient celles de `make dev-up` (PostgreSQL sur `127.0.0.1:15432`, utilisateur `nine`, base `nine`).
 
