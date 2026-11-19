@@ -2,7 +2,7 @@
 
 NineSQL has no release yet: you build it from the repository. This page covers Linux (Debian, Ubuntu), the platforms NineSQL targets, and macOS, which is kept compiling so contributors on a Mac can iterate on the interface ([docs/10](../10-supported-platforms.md)).
 
-What you get today: the main window (navigator, editor tabs and splits, status bar, several windows), the command palette, themes, the connection dialog, sessions to PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB, the DBeaver import, the SQL editor with its results grid, the navigator's object tree and object editor, and data editing, export and import with the export of connections to DBeaver ([Edit data](edit-data.md), [Export and import data](export-import.md)). Not built yet: in-cell editing, script files, packages (phase 6).
+What you get today: the main window (navigator, editor tabs and splits, status bar, several windows), the command palette, themes, the connection dialog, sessions to PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB, the DBeaver import, the SQL editor with its results grid, the navigator's object tree and object editor, data editing, export and import with the export of connections to DBeaver ([Edit data](edit-data.md), [Export and import data](export-import.md)), and script files with session restore ([Run SQL](run-sql.md#12-script-files-and-session-restore)). Not built yet: in-cell editing, packages (phase 6).
 
 ## 1. Install the toolchain
 
@@ -88,10 +88,11 @@ An invalid value or binding never stops NineSQL: the default is used and the pro
 | Path (defaults) | Content |
 |---|---|
 | `~/.config/ninesql/settings.toml` | Appearance, key bindings, execution, history and confirmation preferences |
-| `~/.local/share/ninesql/workspace/<project>/` | `connections.json`, `connection-types.json`, `project.json`, `navigator.json` (navigator filters), `snippets.json` ([SQL snippets](run-sql.md#11-format-sql-and-snippets), when you create it), and `imports/dbeaver-<date>.json` after a [DBeaver import](import-from-dbeaver.md) |
+| `~/.local/share/ninesql/workspace/<project>/` | `connections.json`, `connection-types.json`, `project.json`, `navigator.json` (navigator filters), `snippets.json` ([SQL snippets](run-sql.md#11-format-sql-and-snippets), when you create it), `scripts/` and `scripts.json` ([script files](run-sql.md#12-script-files-and-session-restore) and the connection each one is linked to), and `imports/dbeaver-<date>.json` after a [DBeaver import](import-from-dbeaver.md) |
 | `~/.local/share/ninesql/vault.bin` | The encrypted vault, if you created one ([Secrets](secrets.md)) |
 | `~/.local/share/ninesql/known_hosts` | SSH host keys you trusted in NineSQL |
 | `~/.local/state/ninesql/history.sqlite` | Query history, readable by you only, never with parameter values ([what is recorded](run-sql.md#9-history)) |
+| `~/.local/state/ninesql/session.json` | The scripts open when NineSQL quit, their connections, cursor positions and layout, reopened at the next start; never editor text ([session restore](run-sql.md#12-script-files-and-session-restore)) |
 
 None of these files ever holds a password ([invariant I1](../../CONTEXT.md#invariants-non-negotiable)). The `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` variables move them.
 
